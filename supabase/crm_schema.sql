@@ -366,7 +366,17 @@ create policy "staff read sessions"
 
 grant select, insert, update on public.user_sessions to anon, authenticated;
 
-/** Per-user engagement rollup — what the CRM sorts on. */
+/**
+ * Per-user engagement rollup — what the CRM sorts on.
+ *
+ * The permission check is INSIDE the view on purpose. A Postgres view runs with
+ * its owner's privileges by default, which would let any authenticated caller
+ * read the whole rollup straight past the "staff read sessions" policy below.
+ * security_invoker fixes that, but then the view's safety depends on a flag
+ * staying set — and a flag that silently reverts is a data leak. The where
+ * clause here holds regardless of that setting, or the Postgres version.
+ * Both are applied; either alone would be sufficient.
+ */
 create or replace view public.user_engagement as
   select
     user_id,
@@ -376,12 +386,9 @@ create or replace view public.user_engagement as
     max(coalesce(ended_at, started_at))        as last_seen_at
   from public.user_sessions
   where user_id is not null
+    and (user_id = auth.uid() or public.is_crm_staff())
   group by user_id;
 
--- A view runs with its OWNER's privileges unless told otherwise, which would let
--- any signed-in user read the whole rollup regardless of the "staff read sessions"
--- policy below it. security_invoker makes the caller's RLS apply instead.
--- (Postgres 15+; Supabase is well past that. Harmless to re-run.)
 alter view public.user_engagement set (security_invoker = on);
 
 grant select on public.user_engagement to authenticated;
