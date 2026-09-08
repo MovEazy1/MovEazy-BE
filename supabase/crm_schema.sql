@@ -405,9 +405,23 @@ end $$;
 alter table public.listing_reactions add column if not exists recorded_by text default '';
 alter table public.listing_reactions add column if not exists source text default 'app';  -- app | crm
 
+-- The original constraint was declared inline and unnamed in visits_schema.sql,
+-- so Postgres auto-named it. Don't guess that name: drop every check constraint
+-- on this table and re-add ours. Guessing wrong would leave the old narrow
+-- constraint in place, and 'okay' would then fail at runtime rather than here.
 do $$
+declare
+  c record;
 begin
-  alter table public.listing_reactions drop constraint if exists listing_reactions_reaction_check;
+  for c in
+    select conname
+    from pg_constraint
+    where conrelid = 'public.listing_reactions'::regclass
+      and contype = 'c'
+  loop
+    execute format('alter table public.listing_reactions drop constraint %I', c.conname);
+  end loop;
+
   alter table public.listing_reactions
     add constraint listing_reactions_reaction_check
     check (reaction in ('like','dislike','okay'));
