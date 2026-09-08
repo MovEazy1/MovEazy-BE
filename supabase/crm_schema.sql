@@ -378,6 +378,12 @@ create or replace view public.user_engagement as
   where user_id is not null
   group by user_id;
 
+-- A view runs with its OWNER's privileges unless told otherwise, which would let
+-- any signed-in user read the whole rollup regardless of the "staff read sessions"
+-- policy below it. security_invoker makes the caller's RLS apply instead.
+-- (Postgres 15+; Supabase is well past that. Harmless to re-run.)
+alter view public.user_engagement set (security_invoker = on);
+
 grant select on public.user_engagement to authenticated;
 
 -- ── Additive changes to existing tables ──────────────────────────────────────
