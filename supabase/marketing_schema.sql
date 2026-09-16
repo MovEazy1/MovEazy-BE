@@ -212,9 +212,9 @@ as $$
     );
 $$;
 
-revoke all on function public.can_view_marketing(text) from public;
-revoke all on function public.can_view_marketing_overview() from public;
-revoke all on function public.has_marketing_access() from public;
+revoke all on function public.can_view_marketing(text) from public, anon, authenticated;
+revoke all on function public.can_view_marketing_overview() from public, anon, authenticated;
+revoke all on function public.has_marketing_access() from public, anon, authenticated;
 grant execute on function public.can_view_marketing(text) to authenticated;
 grant execute on function public.can_view_marketing_overview() to authenticated;
 grant execute on function public.has_marketing_access() to authenticated;
@@ -335,7 +335,7 @@ begin
 end;
 $$;
 
-revoke all on function public.record_marketing_click(text, text, text, text, jsonb) from public;
+revoke all on function public.record_marketing_click(text, text, text, text, jsonb) from public, anon, authenticated;
 grant execute on function public.record_marketing_click(text, text, text, text, jsonb)
   to anon, authenticated;
 
@@ -655,16 +655,16 @@ end;
 $mig$;
 
 -- Introspection and build metadata: useful to us, nothing the app should read.
-revoke all on function public._mkt_col(text, text[])     from public;
+revoke all on function public._mkt_col(text, text[])     from public, anon, authenticated;
 alter table public._mkt_build_log enable row level security;
 
-revoke all on function public._mkt_prefs_at(uuid)        from public;
-revoke all on function public._mkt_shortlist_at(uuid)    from public;
-revoke all on function public._mkt_shortlist_count(uuid) from public;
-revoke all on function public._mkt_visit_at(uuid)        from public;
-revoke all on function public._mkt_visit_count(uuid)     from public;
-revoke all on function public._mkt_closed_at(uuid)       from public;
-revoke all on function public._mkt_closed_reason(uuid)   from public;
+revoke all on function public._mkt_prefs_at(uuid)        from public, anon, authenticated;
+revoke all on function public._mkt_shortlist_at(uuid)    from public, anon, authenticated;
+revoke all on function public._mkt_shortlist_count(uuid) from public, anon, authenticated;
+revoke all on function public._mkt_visit_at(uuid)        from public, anon, authenticated;
+revoke all on function public._mkt_visit_count(uuid)     from public, anon, authenticated;
+revoke all on function public._mkt_closed_at(uuid)       from public, anon, authenticated;
+revoke all on function public._mkt_closed_reason(uuid)   from public, anon, authenticated;
 
 /**
  * Every signed-up account that came from a tracked channel, with the moment it
@@ -737,7 +737,7 @@ as $$
   where p_slug is null or c.slug = p_slug;
 $$;
 
-revoke all on function public._marketing_leads(text) from public;
+revoke all on function public._marketing_leads(text) from public, anon, authenticated;
 
 /** Per-channel funnel totals. Internal; wrappers below do the permission check. */
 create or replace function public._marketing_stats(p_slug text default null)
@@ -814,7 +814,7 @@ as $$
   order by coalesce(leads.signups, 0) desc, coalesce(clicks.link_clicks, 0) desc, ch.label;
 $$;
 
-revoke all on function public._marketing_stats(text) from public;
+revoke all on function public._marketing_stats(text) from public, anon, authenticated;
 
 /**
  * The roll-up behind /marketing/head: one row per channel.
@@ -959,10 +959,10 @@ as $$
    order by c.is_overview desc, c.label;
 $$;
 
-revoke all on function public.marketing_overview() from public;
-revoke all on function public.marketing_channel_stats(text) from public;
-revoke all on function public.marketing_channel_leads(text) from public;
-revoke all on function public.my_marketing_channels() from public;
+revoke all on function public.marketing_overview() from public, anon, authenticated;
+revoke all on function public.marketing_channel_stats(text) from public, anon, authenticated;
+revoke all on function public.marketing_channel_leads(text) from public, anon, authenticated;
+revoke all on function public.my_marketing_channels() from public, anon, authenticated;
 grant execute on function public.marketing_overview() to authenticated;
 grant execute on function public.marketing_channel_stats(text) to authenticated;
 grant execute on function public.marketing_channel_leads(text) to authenticated;
@@ -990,6 +990,79 @@ values
   ('reddithsrkora', 'Reddit — HSR / Koramangala', 'The HSR and Koramangala subreddit threads.',
    'reddit', 'community', 'mkt_reddithsrkora', '/', false)
 on conflict (slug) do nothing;
+
+-- ── Lock down ────────────────────────────────────────────────────────────────
+--
+-- Supabase ships `alter default privileges in schema public grant all on
+-- functions to postgres, anon, authenticated, service_role`. Every function
+-- created here therefore arrives with an EXPLICIT execute grant to anon, and
+-- `revoke ... from public` does not touch an explicit grant to a named role —
+-- it only revokes the PUBLIC pseudo-role.
+--
+-- That is not a theoretical gap. Before this block existed, an anonymous caller
+-- holding nothing but the publishable key that ships in the browser bundle
+-- could POST /rest/v1/rpc/_marketing_stats and get every channel's numbers, and
+-- _marketing_leads would have handed over the name, email, phone and full
+-- funnel of every attributed signup — straight past can_view_marketing().
+--
+-- Repeated here, after everything exists, so the file is safe to re-run and so
+-- the revokes cannot be separated from the definitions by a later edit. The
+-- only function anon may call is the click recorder, which is the one that has
+-- to work for a signed-out visitor.
+revoke all on function public._mkt_col(text, text[])                       from public, anon, authenticated;
+revoke all on function public._mkt_owner_eq(text, text, text)              from public, anon, authenticated;
+revoke all on function public._mkt_prefs_at(uuid)                          from public, anon, authenticated;
+revoke all on function public._mkt_shortlist_at(uuid)                      from public, anon, authenticated;
+revoke all on function public._mkt_shortlist_count(uuid)                   from public, anon, authenticated;
+revoke all on function public._mkt_visit_at(uuid)                          from public, anon, authenticated;
+revoke all on function public._mkt_visit_count(uuid)                       from public, anon, authenticated;
+revoke all on function public._mkt_closed_at(uuid)                         from public, anon, authenticated;
+revoke all on function public._mkt_closed_reason(uuid)                     from public, anon, authenticated;
+revoke all on function public._marketing_leads(text)                       from public, anon, authenticated;
+revoke all on function public._marketing_stats(text)                       from public, anon, authenticated;
+
+revoke all on function public.marketing_overview()                         from public, anon;
+revoke all on function public.marketing_channel_stats(text)                from public, anon;
+revoke all on function public.marketing_channel_leads(text)                from public, anon;
+revoke all on function public.my_marketing_channels()                      from public, anon;
+revoke all on function public.can_view_marketing(text)                     from public, anon;
+revoke all on function public.can_view_marketing_overview()                from public, anon;
+revoke all on function public.has_marketing_access()                       from public, anon;
+revoke all on function public.is_super_admin()                             from public, anon;
+
+grant execute on function public.marketing_overview()                      to authenticated;
+grant execute on function public.marketing_channel_stats(text)             to authenticated;
+grant execute on function public.marketing_channel_leads(text)             to authenticated;
+grant execute on function public.my_marketing_channels()                   to authenticated;
+grant execute on function public.can_view_marketing(text)                  to authenticated;
+grant execute on function public.can_view_marketing_overview()             to authenticated;
+grant execute on function public.has_marketing_access()                    to authenticated;
+grant execute on function public.is_super_admin()                          to authenticated;
+
+-- The one exception, and the reason it is safe: it takes an opaque campaign
+-- string, returns only the slug the caller already knew, and can do nothing but
+-- append a row to a table nobody can read.
+grant execute on function public.record_marketing_click(text, text, text, text, jsonb)
+  to anon, authenticated;
+
+-- Tables. RLS already refuses anon on every one of these (each policy is
+-- declared `to authenticated`), so this is the second lock rather than the
+-- first — but a table whose privileges say "anon may select" is one policy edit
+-- away from being readable, and none of these should ever be.
+revoke all on public.marketing_channels  from anon;
+revoke all on public.marketing_access    from anon;
+revoke all on public.marketing_clicks    from anon, authenticated;
+revoke all on public._mkt_build_log      from anon, authenticated;
+
+-- Proof, in one row: anything other than 0 here is an anonymous caller who can
+-- read other people's funnels.
+select count(*) as functions_anon_can_still_execute
+  from pg_proc p
+  join pg_namespace n on n.oid = p.pronamespace
+ where n.nspname = 'public'
+   and (p.proname like '\_mkt\_%' or p.proname like '%marketing%')
+   and p.proname <> 'record_marketing_click'
+   and has_function_privilege('anon', p.oid, 'execute');
 
 -- ── Which funnel steps this project can actually see ─────────────────────────
 --

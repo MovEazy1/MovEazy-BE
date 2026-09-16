@@ -19,6 +19,16 @@ const USER = "11111111-1111-1111-1111-111111111111";
 const PRELUDE = `
 create role anon;
 create role authenticated;
+
+-- The reason a REVOKE from PUBLIC is not enough on a Supabase project, and the
+-- reason this line belongs in the prelude: Supabase ships these, so every
+-- function the migration creates arrives with an explicit EXECUTE grant to
+-- anon. Without reproducing that here, a test would pass while production
+-- served _marketing_leads to anyone holding the publishable key.
+alter default privileges in schema public grant all on functions to anon, authenticated;
+alter default privileges in schema public grant all on tables to anon, authenticated;
+`;
+const PRELUDE_REST = `
 create schema if not exists auth;
 create table auth.users (id uuid primary key, email text);
 create or replace function auth.uid() returns uuid language sql stable as $$ select null::uuid $$;
@@ -138,6 +148,7 @@ for (const s of SCENARIOS) {
   };
 
   await db.exec(PRELUDE);
+  await db.exec(PRELUDE_REST);
   if (s.setup.trim()) await db.exec(s.setup);
 
   console.log(`\n${s.name}`);
@@ -153,6 +164,33 @@ for (const s of SCENARIOS) {
   // What the DO block decided, straight from its own log.
   const built = await db.query("select step, source from public._mkt_build_log order by step");
   for (const r of built.rows) console.log(`  built  ${r.step.padEnd(17)} <- ${r.source}`);
+
+  // The check that matters most, because getting it wrong is silent: an
+  // anonymous caller holding only the publishable key must not be able to
+  // execute anything but the click recorder. _marketing_leads returns names,
+  // emails and phone numbers, and it once answered anon on production.
+  const leaky = await db.query(`
+    select p.proname
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public'
+      and (p.proname like '\\_mkt\\_%' or p.proname like '%marketing%')
+      and p.proname <> 'record_marketing_click'
+      and has_function_privilege('anon', p.oid, 'execute')
+    order by 1
+  `);
+  if (leaky.rows.length) {
+    fail(`anon can execute: ${leaky.rows.map((r) => r.proname).join(", ")}`);
+  } else {
+    console.log("  ok     anon can execute nothing but record_marketing_click");
+  }
+
+  for (const t of ["marketing_clicks", "_mkt_build_log"]) {
+    const canRead = await db.query(
+      `select has_table_privilege('anon', 'public.${t}', 'select') as yes`,
+    );
+    if (canRead.rows[0].yes) fail(`anon holds select on ${t}`);
+  }
 
   // Seed one signup credited to the channel, plus whatever activity this shape
   // can record, then read the funnel back.

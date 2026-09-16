@@ -119,6 +119,7 @@ for (let round = 1; round <= ROUNDS; round++) {
   const db = new PGlite();
   try {
     await db.exec(PRELUDE);
+  await db.exec(PRELUDE_REST);
     if (ddl.trim()) await db.exec(ddl);
   } catch (e) {
     // A schema PGlite itself rejects isn't a finding about our file.
