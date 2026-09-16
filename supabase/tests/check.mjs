@@ -252,5 +252,83 @@ for (const s of SCENARIOS) {
   await db.close();
 }
 
+/**
+ * Who can open what.
+ *
+ * A grant on the roll-up carries every channel with it — /marketing/head shows
+ * one row per channel, so refusing the same person the detail behind a number
+ * they are already reading makes every name on that page a dead link. A grant
+ * on one channel carries only that channel, which is the rule the whole
+ * security-definer design exists to enforce: Rishav sees Rishav.
+ *
+ * Asserted here rather than by signing in, because getting it wrong in the
+ * permissive direction is silent — the dashboard just works, for the wrong
+ * person.
+ */
+{
+  console.log("\naccess  (who can open which dashboard)");
+  const db = new PGlite();
+  await db.exec(PRELUDE);
+  await db.exec(PRELUDE_REST);
+  await db.exec(SQL);
+
+  /** Answer as this email for the next queries. */
+  const as = (email) =>
+    db.exec(
+      `create or replace function auth.jwt() returns jsonb language sql stable
+         as $$ select '{"email":"${email}"}'::jsonb $$;`,
+    );
+
+  await db.exec(`
+    insert into public.marketing_access (email, channel_slug) values
+      ('head@example.com','head'),
+      ('rishav@example.com','rishav');
+  `);
+
+  const can = async (email, slug) => {
+    await as(email);
+    const r = await db.query(`select public.can_view_marketing('${slug}') as yes`);
+    return r.rows[0].yes;
+  };
+
+  const expectations = [
+    ["head@example.com", "rishav", true, "head grant reaches a channel"],
+    ["head@example.com", "fbpage", true, "head grant reaches every channel"],
+    ["head@example.com", "head", true, "head grant reaches the roll-up"],
+    ["rishav@example.com", "rishav", true, "a channel grant reaches its own channel"],
+    ["rishav@example.com", "fbpage", false, "a channel grant does NOT reach another channel"],
+    ["rishav@example.com", "head", false, "a channel grant does NOT reach the roll-up"],
+    ["nobody@example.com", "rishav", false, "no grant reaches nothing"],
+    ["yatharth200018@gmail.com", "fbpage", true, "super admin reaches everything"],
+  ];
+
+  for (const [email, slug, want, why] of expectations) {
+    const got = await can(email, slug);
+    if (got === want) {
+      console.log(`  ok     ${why}`);
+    } else {
+      console.log(`  FAIL   ${why} — ${email} on ${slug}: expected ${want}, got ${got}`);
+      allPassed = false;
+    }
+  }
+
+  // And the list a person is shown has to agree with the checks above.
+  await as("head@example.com");
+  const headSees = await db.query("select count(*)::int as n from public.my_marketing_channels()");
+  await as("rishav@example.com");
+  const rishavSees = await db.query("select count(*)::int as n from public.my_marketing_channels()");
+  console.log(`  lists  head sees ${headSees.rows[0].n} channels, rishav sees ${rishavSees.rows[0].n}`);
+  if (headSees.rows[0].n !== 5) {
+    console.log(`  FAIL   head should list all 5 channels`);
+    allPassed = false;
+  }
+  if (rishavSees.rows[0].n !== 1) {
+    console.log(`  FAIL   rishav should list exactly 1 channel`);
+    allPassed = false;
+  }
+
+  await db.close();
+}
+
 console.log(`\n${allPassed ? "ALL SCENARIOS PASS" : "SOMETHING FAILED"}`);
 process.exit(allPassed ? 0 : 1);

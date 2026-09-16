@@ -187,13 +187,17 @@ create index if not exists user_profiles_signup_campaign_idx
 -- ── Access helpers ───────────────────────────────────────────────────────────
 
 /**
- * May the caller open this channel's dashboard?
+ * Is this channel granted to the caller outright?
+ *
+ * The raw check, with no inheritance in it. Separate from can_view_marketing()
+ * below so the roll-up's "you hold everything" rule can be expressed without
+ * the two functions calling each other in a circle.
  *
  * Security definer so the lookup is not itself gated by marketing_access's
- * policies (which would recurse). The super admin holds every channel; everyone
+ * policies, which would recurse. The super admin holds every channel; everyone
  * else holds exactly what has been granted to their email.
  */
-create or replace function public.can_view_marketing(p_slug text)
+create or replace function public._mkt_has_grant(p_slug text)
 returns boolean
 language sql
 stable
@@ -213,9 +217,9 @@ $$;
 /**
  * May the caller open the roll-up?
  *
- * Exists as its own function only so the marketing_channels read policy can ask
- * the question without selecting from marketing_channels — a policy on a table
- * that reads that same table recurses and Postgres refuses the query outright.
+ * Also a separate function so the marketing_channels read policy can ask the
+ * question without selecting from marketing_channels — a policy on a table that
+ * reads that same table recurses and Postgres refuses the query outright.
  * Security definer sidesteps the policy, which is exactly the point.
  */
 create or replace function public.can_view_marketing_overview()
@@ -229,8 +233,30 @@ as $$
     select 1
     from public.marketing_channels c
     where c.is_overview
-      and public.can_view_marketing(c.slug)
+      and public._mkt_has_grant(c.slug)
   );
+$$;
+
+/**
+ * May the caller open this channel's dashboard?
+ *
+ * A grant on the roll-up carries every channel with it. /marketing/head already
+ * shows one row per channel — clicks, signups, the whole funnel, side by side —
+ * so refusing the same person /marketing/rishav would withhold the detail
+ * behind a number they are already looking at, and make every channel name on
+ * the roll-up a dead link. Granting "head" is granting the comparison, and a
+ * comparison you cannot drill into is a worse version of the same access.
+ *
+ * A grant on one channel still carries only that channel. Rishav sees Rishav.
+ */
+create or replace function public.can_view_marketing(p_slug text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select public._mkt_has_grant(p_slug) or public.can_view_marketing_overview();
 $$;
 
 /** Any marketing dashboard at all — gates the shell and the channel picker. */
@@ -250,6 +276,7 @@ as $$
     );
 $$;
 
+revoke all on function public._mkt_has_grant(text) from public, anon, authenticated;
 revoke all on function public.can_view_marketing(text) from public, anon, authenticated;
 revoke all on function public.can_view_marketing_overview() from public, anon, authenticated;
 revoke all on function public.has_marketing_access() from public, anon, authenticated;
@@ -1089,6 +1116,7 @@ on conflict (slug) do nothing;
 -- to work for a signed-out visitor.
 revoke all on function public._mkt_col(text, text[])                       from public, anon, authenticated;
 revoke all on function public._mkt_owner_eq(text, text, text)              from public, anon, authenticated;
+revoke all on function public._mkt_has_grant(text)                         from public, anon, authenticated;
 revoke all on function public._mkt_prefs_at(uuid)                          from public, anon, authenticated;
 revoke all on function public._mkt_shortlist_at(uuid)                      from public, anon, authenticated;
 revoke all on function public._mkt_shortlist_count(uuid)                   from public, anon, authenticated;
