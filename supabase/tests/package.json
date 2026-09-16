@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node check.mjs && node fuzz.mjs 40 1 && node fuzz.mjs 40 99"
+    "test": "node check.mjs && node upgrade.mjs && node fuzz.mjs 40 1 && node fuzz.mjs 40 99"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.3.14"

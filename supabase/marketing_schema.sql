@@ -784,7 +784,14 @@ revoke all on function public._mkt_closed_reason(uuid)   from public, anon, auth
  * ever having saved a flat, and showing that as "0 shortlisted, 1 visit" is the
  * truth. Totals are counted the same way, so the columns do not have to descend.
  */
-create or replace function public._marketing_leads(p_slug text default null)
+-- drop-then-create, not create-or-replace: Postgres refuses to replace a
+-- function whose RETURNS TABLE shape changed, and the Supabase SQL editor runs
+-- this file in one transaction — so adding a single column to one of these
+-- rolled the WHOLE migration back, silently undoing the access rules and the
+-- platform column along with it. None of these are referenced by a policy, so
+-- dropping them is safe.
+drop function if exists public._marketing_leads(text);
+create function public._marketing_leads(p_slug text default null)
 returns table (
   channel_slug        text,
   user_id             uuid,
@@ -844,7 +851,8 @@ $$;
 revoke all on function public._marketing_leads(text) from public, anon, authenticated;
 
 /** Per-channel funnel totals. Internal; wrappers below do the permission check. */
-create or replace function public._marketing_stats(p_slug text default null)
+drop function if exists public._marketing_stats(text);
+create function public._marketing_stats(p_slug text default null)
 returns table (
   slug              text,
   label             text,
@@ -929,7 +937,8 @@ revoke all on function public._marketing_stats(text) from public, anon, authenti
  * "you don't have access", and a raised exception here would only turn that
  * into a broken page.
  */
-create or replace function public.marketing_overview()
+drop function if exists public.marketing_overview();
+create function public.marketing_overview()
 returns table (
   slug              text,
   label             text,
@@ -965,7 +974,8 @@ end;
 $$;
 
 /** The header row on one channel's dashboard. */
-create or replace function public.marketing_channel_stats(p_slug text)
+drop function if exists public.marketing_channel_stats(text);
+create function public.marketing_channel_stats(p_slug text)
 returns table (
   slug              text,
   label             text,
@@ -998,7 +1008,8 @@ end;
 $$;
 
 /** The people behind those numbers, one row each. */
-create or replace function public.marketing_channel_leads(p_slug text)
+drop function if exists public.marketing_channel_leads(text);
+create function public.marketing_channel_leads(p_slug text)
 returns table (
   user_id             uuid,
   email               text,
@@ -1044,7 +1055,8 @@ $$;
  * this is what the /marketing index renders, and what decides whether a direct
  * visit to someone else's URL gets a dashboard or a refusal.
  */
-create or replace function public.my_marketing_channels()
+drop function if exists public.my_marketing_channels();
+create function public.my_marketing_channels()
 returns table (
   slug         text,
   label        text,
