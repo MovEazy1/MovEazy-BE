@@ -1,10 +1,18 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Marketing channel dashboards (/marketing/* in MovEazy-FE).
 --
--- Run ONCE in the Supabase SQL editor, AFTER crm_schema.sql (needs
--- public.is_super_admin()), customer_schema.sql, user_requirements_schema.sql,
--- user_actions_schema.sql and visits_schema.sql. Safe to re-run: every
--- statement is idempotent.
+-- Run in the Supabase SQL editor. Safe to re-run: every statement is
+-- idempotent, and re-running is how you pick up a funnel source that didn't
+-- exist the first time.
+--
+-- The only hard requirement is public.user_profiles. Everything else it reads —
+-- user_actions, saved_properties, listing_reactions, user_requirements,
+-- customer_search_profiles, visit_bookings, crm_clients — is optional: the
+-- funnel helpers are built from whichever of those tables the project has. The
+-- environments have drifted apart (production had no user_actions when this
+-- shipped), and failing the whole migration on the first missing table would
+-- leave that project with no dashboards rather than an honest partial one.
+-- After applying any of those schemas, run this file again.
 --
 -- The question this answers: of the people who arrived from one specific post,
 -- group or page, how many got as far as each step of the funnel — and who are
@@ -103,14 +111,34 @@ create index if not exists marketing_clicks_anon_idx
 alter table public.marketing_clicks enable row level security;
 
 -- ── The columns a signup is credited through ─────────────────────────────────
--- These arrive with MovEazy-FE/db/2026-09-16_signup_attribution.sql, which is
--- where they are documented. Repeated here — idempotently — because every
--- reporting function below joins on signup_attribution, and this whole file
--- would fail on a project where that migration hasn't been run yet.
+-- These arrive with MovEazy-FE/db/2026-09-16_signup_attribution.sql and with
+-- crm_schema.sql, which is where they are documented. Repeated here —
+-- idempotently — because every reporting function below reads them, and this
+-- whole file would fail on a project where either migration hasn't been run.
 alter table public.user_profiles
-  add column if not exists attribution_token   text,
-  add column if not exists signup_source       text,
-  add column if not exists signup_attribution  jsonb;
+  add column if not exists attribution_token     text,
+  add column if not exists signup_source         text,
+  add column if not exists signup_attribution    jsonb,
+  add column if not exists search_status         text not null default 'searching',
+  add column if not exists search_closed_at      timestamptz,
+  add column if not exists search_closed_reason  text default '';
+
+/**
+ * The one hardcoded identity, mirrored from crm_schema.sql and from
+ * MovEazy-FE/src/lib/adminAccess.js. Defined here too so this file stands on
+ * its own: create or replace with the same body is a no-op where crm_schema has
+ * already run, and the difference between a working dashboard and a 42883 where
+ * it hasn't. Change it in all three places together.
+ */
+create or replace function public.is_super_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select lower(coalesce(auth.jwt() ->> 'email', '')) = 'yatharth200018@gmail.com';
+$$;
 
 -- Counting signups per channel means joining on this expression on every
 -- dashboard load. Partial, because unattributed rows can never match.
@@ -314,6 +342,168 @@ grant execute on function public.record_marketing_click(text, text, text, text, 
 -- ── Reporting ────────────────────────────────────────────────────────────────
 
 /**
+ * The funnel steps, one small function each, built against the tables this
+ * project actually has.
+ *
+ * The four middle steps are evidenced by tables that were introduced at
+ * different times and are not all present in every environment — production had
+ * no user_actions when this shipped. Naming a missing one directly would fail
+ * the whole migration on a 42P01 and leave the project with no dashboards at
+ * all, which is a far worse answer than a dashboard whose "Prop shortlisted"
+ * column is honestly empty.
+ *
+ * So each helper's body is assembled from the sources that exist right now. Two
+ * consequences worth knowing:
+ *
+ *   - Adding one of these tables later does NOT retroactively widen the
+ *     helpers. Re-run this file after any such migration; it is idempotent and
+ *     will pick the new source up.
+ *   - A step with no source at all reports null rather than zero-as-fact. The
+ *     dashboard then shows nobody reaching it, which is true of what we can
+ *     see, and the comment above says why.
+ */
+do $mig$
+declare
+  ts    text[] := '{}';   -- expressions for "when did this first happen"
+  ids   text[] := '{}';   -- branches of the "how many distinct properties" union
+  expr  text;
+begin
+  -- Told us what they want: the guided Find My Flat questionnaire, or the
+  -- lighter search profile saved at signup. Either is a filled preference.
+  if to_regclass('public.user_requirements') is not null then
+    ts := ts || $q$(select min(r.created_at) from public.user_requirements r where r.user_id = p_user)$q$;
+  end if;
+  if to_regclass('public.customer_search_profiles') is not null then
+    ts := ts || $q$(select min(s.updated_at) from public.customer_search_profiles s where s.user_id = p_user)$q$;
+  end if;
+
+  expr := case when cardinality(ts) = 0 then 'null::timestamptz'
+               else 'least(' || array_to_string(ts, ', ') || ')' end;
+  execute format($fn$
+    create or replace function public._mkt_prefs_at(p_user uuid)
+    returns timestamptz language sql stable security definer set search_path = public
+    as $body$ select %s $body$;
+  $fn$, expr);
+
+  -- Saving a flat is logged three different ways depending on which surface the
+  -- person used, and all three count.
+  ts := '{}';
+  if to_regclass('public.user_actions') is not null then
+    ts  := ts  || $q$(select min(a.created_at) from public.user_actions a
+                       where a.user_id = p_user and a.action ~* 'shortlist|save|like|favou?rite')$q$;
+    ids := ids || $q$select a.property_id as pid from public.user_actions a
+                      where a.user_id = p_user and a.action ~* 'shortlist|save|like|favou?rite'
+                        and a.property_id is not null$q$;
+  end if;
+  if to_regclass('public.saved_properties') is not null then
+    ts  := ts  || $q$(select min(sp.created_at) from public.saved_properties sp where sp.customer_id = p_user)$q$;
+    ids := ids || $q$select sp.listing_id as pid from public.saved_properties sp where sp.customer_id = p_user$q$;
+  end if;
+  if to_regclass('public.listing_reactions') is not null then
+    ts  := ts  || $q$(select min(lr.updated_at) from public.listing_reactions lr
+                       where lr.user_id = p_user and lr.reaction = 'like')$q$;
+    ids := ids || $q$select lr.property_id as pid from public.listing_reactions lr
+                      where lr.user_id = p_user and lr.reaction = 'like'$q$;
+  end if;
+
+  expr := case when cardinality(ts) = 0 then 'null::timestamptz'
+               else 'least(' || array_to_string(ts, ', ') || ')' end;
+  execute format($fn$
+    create or replace function public._mkt_shortlist_at(p_user uuid)
+    returns timestamptz language sql stable security definer set search_path = public
+    as $body$ select %s $body$;
+  $fn$, expr);
+
+  expr := case when cardinality(ids) = 0 then '0'
+               else '(select count(distinct x.pid)::int from ('
+                    || array_to_string(ids, ' union ') || ') x)' end;
+  execute format($fn$
+    create or replace function public._mkt_shortlist_count(p_user uuid)
+    returns int language sql stable security definer set search_path = public
+    as $body$ select %s $body$;
+  $fn$, expr);
+
+  -- A booked slot is a scheduled visit. A tour request is only the ask, so it
+  -- is the fallback rather than an equal source — used only where the booking
+  -- table doesn't exist, and then said plainly rather than counted as more.
+  if to_regclass('public.visit_bookings') is not null then
+    execute $fn$
+      create or replace function public._mkt_visit_at(p_user uuid)
+      returns timestamptz language sql stable security definer set search_path = public
+      as $body$ select min(v.created_at) from public.visit_bookings v where v.user_id = p_user $body$;
+      $fn$;
+    execute $fn$
+      create or replace function public._mkt_visit_count(p_user uuid)
+      returns int language sql stable security definer set search_path = public
+      as $body$ select count(*)::int from public.visit_bookings v where v.user_id = p_user $body$;
+      $fn$;
+  elsif to_regclass('public.visit_requests') is not null then
+    execute $fn$
+      create or replace function public._mkt_visit_at(p_user uuid)
+      returns timestamptz language sql stable security definer set search_path = public
+      as $body$ select min(vr.created_at) from public.visit_requests vr where vr.customer_id = p_user $body$;
+      $fn$;
+    execute $fn$
+      create or replace function public._mkt_visit_count(p_user uuid)
+      returns int language sql stable security definer set search_path = public
+      as $body$ select count(*)::int from public.visit_requests vr where vr.customer_id = p_user $body$;
+      $fn$;
+  else
+    execute $fn$
+      create or replace function public._mkt_visit_at(p_user uuid)
+      returns timestamptz language sql stable security definer set search_path = public
+      as $body$ select null::timestamptz $body$;
+      $fn$;
+    execute $fn$
+      create or replace function public._mkt_visit_count(p_user uuid)
+      returns int language sql stable security definer set search_path = public
+      as $body$ select 0 $body$;
+      $fn$;
+  end if;
+
+  -- Closed means the search ended with us, from either side of the house: the
+  -- flag the product writes on the profile, or the CRM marking the deal done.
+  -- 'closed_outside' is deliberately not counted — a channel does not get
+  -- credit for a person who rented somewhere else.
+  ts := array[$q$(select case when up.search_status = 'closed_by_us'
+                              then coalesce(up.search_closed_at, up.updated_at) end
+                    from public.user_profiles up where up.id = p_user)$q$];
+  if to_regclass('public.crm_clients') is not null then
+    ts := ts || $q$(select min(cc.closed_at) from public.crm_clients cc
+                     where cc.user_id = p_user and cc.status = 'closed_by_us')$q$;
+  end if;
+
+  execute format($fn$
+    create or replace function public._mkt_closed_at(p_user uuid)
+    returns timestamptz language sql stable security definer set search_path = public
+    as $body$ select least(%s) $body$;
+  $fn$, array_to_string(ts, ', '));
+
+  ts := array[$q$(select nullif(up.search_closed_reason, '')
+                    from public.user_profiles up where up.id = p_user)$q$];
+  if to_regclass('public.crm_clients') is not null then
+    ts := ts || $q$(select cc.closed_reason from public.crm_clients cc
+                     where cc.user_id = p_user and cc.status = 'closed_by_us'
+                     order by cc.closed_at nulls last limit 1)$q$;
+  end if;
+
+  execute format($fn$
+    create or replace function public._mkt_closed_reason(p_user uuid)
+    returns text language sql stable security definer set search_path = public
+    as $body$ select coalesce(%s, '') $body$;
+  $fn$, array_to_string(ts, ', '));
+end;
+$mig$;
+
+revoke all on function public._mkt_prefs_at(uuid)        from public;
+revoke all on function public._mkt_shortlist_at(uuid)    from public;
+revoke all on function public._mkt_shortlist_count(uuid) from public;
+revoke all on function public._mkt_visit_at(uuid)        from public;
+revoke all on function public._mkt_visit_count(uuid)     from public;
+revoke all on function public._mkt_closed_at(uuid)       from public;
+revoke all on function public._mkt_closed_reason(uuid)   from public;
+
+/**
  * Every signed-up account that came from a tracked channel, with the moment it
  * reached each funnel step.
  *
@@ -361,53 +551,16 @@ as $$
     coalesce(p.phone, ''),
     p.created_at,
 
-    -- "Told us what they want": the guided Find My Flat questionnaire, or the
-    -- lighter search profile saved at signup. Either is a filled preference.
-    least(
-      (select min(r.created_at) from public.user_requirements r where r.user_id = p.id),
-      (select min(s.updated_at) from public.customer_search_profiles s where s.user_id = p.id)
-    ),
-
-    -- Saving a flat is logged three different ways depending on which surface
-    -- the person used, and all three count.
-    least(
-      (select min(a.created_at) from public.user_actions a
-        where a.user_id = p.id and a.action ~* 'shortlist|save|like|favou?rite'),
-      (select min(sp.created_at) from public.saved_properties sp where sp.customer_id = p.id),
-      (select min(lr.updated_at) from public.listing_reactions lr
-        where lr.user_id = p.id and lr.reaction = 'like')
-    ),
-    (
-      select count(distinct x.property_id)::int from (
-        select a.property_id from public.user_actions a
-          where a.user_id = p.id and a.action ~* 'shortlist|save|like|favou?rite'
-            and a.property_id is not null
-        union
-        select sp.listing_id from public.saved_properties sp where sp.customer_id = p.id
-        union
-        select lr.property_id from public.listing_reactions lr
-          where lr.user_id = p.id and lr.reaction = 'like'
-      ) x
-    ),
-
-    (select min(v.created_at) from public.visit_bookings v where v.user_id = p.id),
-    (select count(*)::int from public.visit_bookings v where v.user_id = p.id),
-
-    -- Closed means the search ended with us, from either side of the house: the
-    -- flag the product writes on the profile, or the CRM marking the deal done.
-    least(
-      case when p.search_status = 'closed_by_us'
-           then coalesce(p.search_closed_at, p.updated_at) end,
-      (select min(cc.closed_at) from public.crm_clients cc
-        where cc.user_id = p.id and cc.status = 'closed_by_us')
-    ),
-    coalesce(
-      nullif(p.search_closed_reason, ''),
-      (select cc.closed_reason from public.crm_clients cc
-        where cc.user_id = p.id and cc.status = 'closed_by_us'
-        order by cc.closed_at nulls last limit 1),
-      ''
-    ),
+    -- Each step's evidence is spread across tables that don't all exist in
+    -- every environment, so the definitions live in the helpers built above
+    -- rather than inline here. See the DO block for what each one reads.
+    public._mkt_prefs_at(p.id),
+    public._mkt_shortlist_at(p.id),
+    public._mkt_shortlist_count(p.id),
+    public._mkt_visit_at(p.id),
+    public._mkt_visit_count(p.id),
+    public._mkt_closed_at(p.id),
+    public._mkt_closed_reason(p.id),
 
     coalesce(p.signup_attribution ->> 'source', ''),
     coalesce(p.signup_attribution ->> 'medium', ''),
@@ -674,6 +827,20 @@ values
   ('reddithsrkora', 'Reddit — HSR / Koramangala', 'The HSR and Koramangala subreddit threads.',
    'reddit', 'community', 'mkt_reddithsrkora', '/', false)
 on conflict (slug) do nothing;
+
+-- ── Which funnel steps this project can actually see ─────────────────────────
+-- Run this after applying. A 'missing' row is a column that will read empty on
+-- every dashboard until that schema is applied and this file is re-run.
+select step, case when present then 'ok' else 'missing — apply its schema, then re-run this file' end as status
+from (values
+  ('Pref filled  (user_requirements)',      to_regclass('public.user_requirements')       is not null),
+  ('Pref filled  (customer_search_profiles)', to_regclass('public.customer_search_profiles') is not null),
+  ('Shortlisted  (user_actions)',           to_regclass('public.user_actions')            is not null),
+  ('Shortlisted  (saved_properties)',       to_regclass('public.saved_properties')        is not null),
+  ('Shortlisted  (listing_reactions)',      to_regclass('public.listing_reactions')       is not null),
+  ('Visit sched. (visit_bookings)',         to_regclass('public.visit_bookings')          is not null),
+  ('Closed       (crm_clients)',            to_regclass('public.crm_clients')             is not null)
+) as t(step, present);
 
 -- ── Check it landed ──────────────────────────────────────────────────────────
 --
