@@ -68,6 +68,44 @@ create table if not exists public.marketing_channels (
 create unique index if not exists marketing_channels_campaign_idx
   on public.marketing_channels (lower(utm_campaign));
 
+/**
+ * Which share menu this channel belongs under, in the CRM's property share.
+ *
+ * Deliberately separate from utm_source. utm_source names the surface a visitor
+ * came from; platform names where an agent goes to post. They usually agree,
+ * but not always: a Facebook group run by one person is posted to Facebook
+ * while still deserving its own source, and collapsing the two would either
+ * lose the distinction or put the channel in the wrong menu.
+ *
+ * Added nullable and backfilled rather than defaulted, so re-running this file
+ * cannot reset a platform someone has since chosen by hand.
+ */
+alter table public.marketing_channels add column if not exists platform text;
+
+update public.marketing_channels
+   set platform = case
+         -- Rishav's group is posted to Facebook, which is where the share menu
+         -- has to offer it, whatever its own utm_source says.
+         when slug = 'rishav'                then 'facebook'
+         when is_overview                    then 'none'
+         when utm_source ilike 'facebook'    then 'facebook'
+         when utm_source ilike 'reddit'      then 'reddit'
+         when utm_source ilike 'instagram'   then 'instagram'
+         when utm_source ilike 'whatsapp'    then 'whatsapp'
+         when utm_source ilike 'linkedin'    then 'linkedin'
+         when utm_source ilike 'twitter'
+           or utm_source ilike 'x'           then 'twitter'
+         else 'other'
+       end
+ where platform is null;
+
+alter table public.marketing_channels alter column platform set default 'other';
+alter table public.marketing_channels alter column platform set not null;
+
+create index if not exists marketing_channels_platform_idx
+  on public.marketing_channels (platform)
+  where not is_overview and active;
+
 alter table public.marketing_channels enable row level security;
 
 -- ── Who may open which dashboard ─────────────────────────────────────────────
@@ -221,13 +259,52 @@ grant execute on function public.has_marketing_access() to authenticated;
 
 -- ── Policies ─────────────────────────────────────────────────────────────────
 
--- A channel row is readable by anyone who can open that channel, and by anyone
--- who can open the roll-up (which has to name every channel it reports on).
+/**
+ * May the caller list the channels in order to post to one?
+ *
+ * CRM staff need the channel list to share a property to the right surface —
+ * without it the share menu is empty for everyone who isn't a marketing
+ * grantee, and an agent falls back to posting an unattributed link, which is
+ * the exact failure these dashboards exist to end.
+ *
+ * Reading a channel row is not reading its funnel. This grants the name and the
+ * UTM parameters, which are public the moment a link is posted anyway. The
+ * numbers stay behind can_view_marketing().
+ *
+ * Built conditionally because is_crm_staff() comes from crm_schema.sql, and
+ * this file has already been bitten four times by assuming another migration
+ * ran.
+ */
+do $share$
+begin
+  if to_regprocedure('public.is_crm_staff()') is not null then
+    execute $p$
+      create or replace function public.can_list_marketing_channels()
+      returns boolean language sql stable security definer set search_path = public
+      as $b$ select public.is_super_admin() or public.has_marketing_access() or public.is_crm_staff() $b$;
+    $p$;
+  else
+    execute $p$
+      create or replace function public.can_list_marketing_channels()
+      returns boolean language sql stable security definer set search_path = public
+      as $b$ select public.is_super_admin() or public.has_marketing_access() $b$;
+    $p$;
+  end if;
+end;
+$share$;
+
+-- A channel row is readable by anyone who can open that channel, by anyone who
+-- can open the roll-up (which has to name every channel it reports on), and by
+-- CRM staff, who need somewhere to post to.
 drop policy if exists "marketing read own channels" on public.marketing_channels;
 create policy "marketing read own channels"
   on public.marketing_channels for select
   to authenticated
-  using (public.can_view_marketing(slug) or public.can_view_marketing_overview());
+  using (
+    public.can_view_marketing(slug)
+    or public.can_view_marketing_overview()
+    or public.can_list_marketing_channels()
+  );
 
 drop policy if exists "super admin writes channels" on public.marketing_channels;
 create policy "super admin writes channels"
@@ -946,14 +1023,15 @@ returns table (
   label        text,
   description  text,
   is_overview  boolean,
-  active       boolean
+  active       boolean,
+  platform     text
 )
 language sql
 stable
 security definer
 set search_path = public
 as $$
-  select c.slug, c.label, c.description, c.is_overview, c.active
+  select c.slug, c.label, c.description, c.is_overview, c.active, c.platform
     from public.marketing_channels c
    where public.can_view_marketing(c.slug)
    order by c.is_overview desc, c.label;
@@ -973,22 +1051,22 @@ grant execute on function public.my_marketing_channels() to authenticated;
 -- silently reset a campaign string that links already in the wild depend on.
 
 insert into public.marketing_channels
-  (slug, label, description, utm_source, utm_medium, utm_campaign, landing_path, is_overview)
+  (slug, label, description, utm_source, utm_medium, utm_campaign, landing_path, is_overview, platform)
 values
   ('head', 'All channels', 'Every marketing channel side by side.',
-   'moveazy', 'internal', 'mkt_head', '/', true),
+   'moveazy', 'internal', 'mkt_head', '/', true, 'none'),
 
-  ('rishav', 'Rishav''s group', 'Leads from the WhatsApp group Rishav runs.',
-   'rishav', 'group', 'mkt_rishav', '/', false),
+  ('rishav', 'Rishav''s group', 'Leads from the Facebook group Rishav runs.',
+   'rishav', 'group', 'mkt_rishav', '/', false, 'facebook'),
 
   ('fbprofile', 'Facebook profile', 'Posts from the MovEazy founder profile.',
-   'facebook', 'profile', 'mkt_fbprofile', '/', false),
+   'facebook', 'profile', 'mkt_fbprofile', '/', false, 'facebook'),
 
   ('fbpage', 'Facebook page', 'Posts from the MovEazy Facebook page.',
-   'facebook', 'page', 'mkt_fbpage', '/', false),
+   'facebook', 'page', 'mkt_fbpage', '/', false, 'facebook'),
 
   ('reddithsrkora', 'Reddit — HSR / Koramangala', 'The HSR and Koramangala subreddit threads.',
-   'reddit', 'community', 'mkt_reddithsrkora', '/', false)
+   'reddit', 'community', 'mkt_reddithsrkora', '/', false, 'reddit')
 on conflict (slug) do nothing;
 
 -- ── Lock down ────────────────────────────────────────────────────────────────
@@ -1028,6 +1106,7 @@ revoke all on function public.my_marketing_channels()                      from 
 revoke all on function public.can_view_marketing(text)                     from public, anon;
 revoke all on function public.can_view_marketing_overview()                from public, anon;
 revoke all on function public.has_marketing_access()                       from public, anon;
+revoke all on function public.can_list_marketing_channels()                from public, anon;
 revoke all on function public.is_super_admin()                             from public, anon;
 
 grant execute on function public.marketing_overview()                      to authenticated;
@@ -1037,6 +1116,7 @@ grant execute on function public.my_marketing_channels()                   to au
 grant execute on function public.can_view_marketing(text)                  to authenticated;
 grant execute on function public.can_view_marketing_overview()             to authenticated;
 grant execute on function public.has_marketing_access()                    to authenticated;
+grant execute on function public.can_list_marketing_channels()             to authenticated;
 grant execute on function public.is_super_admin()                          to authenticated;
 
 -- The one exception, and the reason it is safe: it takes an opaque campaign
