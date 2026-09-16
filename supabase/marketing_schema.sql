@@ -371,10 +371,10 @@ begin
   -- Told us what they want: the guided Find My Flat questionnaire, or the
   -- lighter search profile saved at signup. Either is a filled preference.
   if to_regclass('public.user_requirements') is not null then
-    ts := ts || $q$(select min(r.created_at) from public.user_requirements r where r.user_id = p_user)$q$;
+    ts := ts || $q$(select min(r.created_at) from public.user_requirements r where r.user_id = p_user)$q$::text;
   end if;
   if to_regclass('public.customer_search_profiles') is not null then
-    ts := ts || $q$(select min(s.updated_at) from public.customer_search_profiles s where s.user_id = p_user)$q$;
+    ts := ts || $q$(select min(s.updated_at) from public.customer_search_profiles s where s.user_id = p_user)$q$::text;
   end if;
 
   expr := case when cardinality(ts) = 0 then 'null::timestamptz'
@@ -390,20 +390,20 @@ begin
   ts := '{}';
   if to_regclass('public.user_actions') is not null then
     ts  := ts  || $q$(select min(a.created_at) from public.user_actions a
-                       where a.user_id = p_user and a.action ~* 'shortlist|save|like|favou?rite')$q$;
+                       where a.user_id = p_user and a.action ~* 'shortlist|save|like|favou?rite')$q$::text;
     ids := ids || $q$select a.property_id as pid from public.user_actions a
                       where a.user_id = p_user and a.action ~* 'shortlist|save|like|favou?rite'
-                        and a.property_id is not null$q$;
+                        and a.property_id is not null$q$::text;
   end if;
   if to_regclass('public.saved_properties') is not null then
-    ts  := ts  || $q$(select min(sp.created_at) from public.saved_properties sp where sp.customer_id = p_user)$q$;
-    ids := ids || $q$select sp.listing_id as pid from public.saved_properties sp where sp.customer_id = p_user$q$;
+    ts  := ts  || $q$(select min(sp.created_at) from public.saved_properties sp where sp.customer_id = p_user)$q$::text;
+    ids := ids || $q$select sp.listing_id as pid from public.saved_properties sp where sp.customer_id = p_user$q$::text;
   end if;
   if to_regclass('public.listing_reactions') is not null then
     ts  := ts  || $q$(select min(lr.updated_at) from public.listing_reactions lr
-                       where lr.user_id = p_user and lr.reaction = 'like')$q$;
+                       where lr.user_id = p_user and lr.reaction = 'like')$q$::text;
     ids := ids || $q$select lr.property_id as pid from public.listing_reactions lr
-                      where lr.user_id = p_user and lr.reaction = 'like'$q$;
+                      where lr.user_id = p_user and lr.reaction = 'like'$q$::text;
   end if;
 
   expr := case when cardinality(ts) = 0 then 'null::timestamptz'
@@ -467,10 +467,10 @@ begin
   -- credit for a person who rented somewhere else.
   ts := array[$q$(select case when up.search_status = 'closed_by_us'
                               then coalesce(up.search_closed_at, up.updated_at) end
-                    from public.user_profiles up where up.id = p_user)$q$];
+                    from public.user_profiles up where up.id = p_user)$q$::text];
   if to_regclass('public.crm_clients') is not null then
     ts := ts || $q$(select min(cc.closed_at) from public.crm_clients cc
-                     where cc.user_id = p_user and cc.status = 'closed_by_us')$q$;
+                     where cc.user_id = p_user and cc.status = 'closed_by_us')$q$::text;
   end if;
 
   execute format($fn$
@@ -480,11 +480,11 @@ begin
   $fn$, array_to_string(ts, ', '));
 
   ts := array[$q$(select nullif(up.search_closed_reason, '')
-                    from public.user_profiles up where up.id = p_user)$q$];
+                    from public.user_profiles up where up.id = p_user)$q$::text];
   if to_regclass('public.crm_clients') is not null then
     ts := ts || $q$(select cc.closed_reason from public.crm_clients cc
                      where cc.user_id = p_user and cc.status = 'closed_by_us'
-                     order by cc.closed_at nulls last limit 1)$q$;
+                     order by cc.closed_at nulls last limit 1)$q$::text;
   end if;
 
   execute format($fn$
