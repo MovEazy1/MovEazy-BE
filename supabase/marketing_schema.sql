@@ -342,21 +342,28 @@ grant execute on function public.record_marketing_click(text, text, text, text, 
 -- ── Reporting ────────────────────────────────────────────────────────────────
 
 /**
- * The funnel steps, one small function each, built against the tables and
- * columns this project actually has.
+ * The funnel steps, one small function each, built against the tables, columns
+ * AND column types this project actually has.
  *
  * The four middle steps are evidenced by tables that were introduced at
- * different times, and the environments have drifted in two separate ways:
- * production had no user_actions at all when this shipped, and its
- * saved_properties has neither of the owner columns the repo's schema defines.
- * Naming either directly fails the whole migration (42P01, then 42703) and
- * leaves that project with no dashboards — a far worse answer than a dashboard
- * whose "Prop shortlisted" column is honestly empty.
+ * different times, and production drifted from the repo's schemas in three
+ * separate ways, each of which took the migration down on its own:
  *
- * So nothing here is assumed. Each source is resolved at apply time: does the
- * table exist, and which of the plausible column spellings does it use. A
- * source missing its table, or missing a column with no usable alternative, is
- * dropped from that step's expression rather than breaking the file.
+ *   42P01  no user_actions table at all
+ *   42703  saved_properties without the customer_id the schema defines
+ *   42804  saved_properties.property_id is uuid; listing_reactions' is text
+ *
+ * Naming any of them directly leaves that project with no dashboards — a far
+ * worse answer than a dashboard whose "Prop shortlisted" column is honestly
+ * empty. So nothing here is assumed. Each source is resolved at apply time:
+ * does the table exist, which of the plausible column spellings does it use,
+ * and what type is that column. A source missing a column with no usable
+ * alternative is dropped from that step rather than breaking the file.
+ *
+ * Types are handled rather than hoped for. Ids are compared as their own type
+ * where that works and as text where it doesn't, and property ids are unioned
+ * as text — two tables disagreeing about whether a property id is a uuid is
+ * exactly the situation this file exists to survive.
  *
  * Two consequences worth knowing:
  *
@@ -388,6 +395,31 @@ as $$
   limit 1;
 $$;
 
+/**
+ * `alias.column = p_user`, written so it compiles whichever type the column is.
+ *
+ * A uuid column compares directly and keeps its index. Anything else — text
+ * holding a uuid, which is how some of these tables were built — is compared as
+ * text. Assuming uuid everywhere is what 42804 looks like from the other side.
+ */
+create or replace function public._mkt_owner_eq(p_table text, p_column text, p_alias text)
+returns text
+language sql
+stable
+as $$
+  select case
+    when exists (
+      select 1
+      from pg_attribute a
+      where a.attrelid = to_regclass('public.' || p_table)
+        and a.attname = p_column
+        and a.atttypid = 'uuid'::regtype
+    )
+    then format('%I.%I = p_user', p_alias, p_column)
+    else format('%I.%I::text = p_user::text', p_alias, p_column)
+  end;
+$$;
+
 /** What each step resolved to, so the answer survives the SQL editor session. */
 create table if not exists public._mkt_build_log (
   step      text primary key,
@@ -405,6 +437,8 @@ declare
   c_when text;             -- the column naming the moment
   c_what text;             -- the column naming the property
   c_act  text;             -- user_actions' "which action" column
+  eq     text;             -- the "is this that person's row" predicate
+  crm_ok boolean;          -- crm_clients has everything the closed test needs
 begin
   -- ── Pref filled ────────────────────────────────────────────────────────────
   -- The guided Find My Flat questionnaire, or the lighter search profile saved
@@ -412,16 +446,16 @@ begin
   c_who  := public._mkt_col('user_requirements', 'user_id', 'id');
   c_when := public._mkt_col('user_requirements', 'created_at', 'updated_at');
   if c_who is not null and c_when is not null then
-    ts    := ts    || format('(select min(r.%I) from public.user_requirements r where r.%I = p_user)',
-                             c_when, c_who);
+    eq    := public._mkt_owner_eq('user_requirements', c_who, 'r');
+    ts    := ts    || format('(select min(r.%I) from public.user_requirements r where %s)', c_when, eq);
     froms := froms || format('user_requirements.%s', c_when);
   end if;
 
   c_who  := public._mkt_col('customer_search_profiles', 'user_id', 'customer_id', 'id');
   c_when := public._mkt_col('customer_search_profiles', 'updated_at', 'created_at');
   if c_who is not null and c_when is not null then
-    ts    := ts    || format('(select min(s.%I) from public.customer_search_profiles s where s.%I = p_user)',
-                             c_when, c_who);
+    eq    := public._mkt_owner_eq('customer_search_profiles', c_who, 's');
+    ts    := ts    || format('(select min(s.%I) from public.customer_search_profiles s where %s)', c_when, eq);
     froms := froms || format('customer_search_profiles.%s', c_when);
   end if;
 
@@ -440,7 +474,8 @@ begin
 
   -- ── Prop shortlisted ───────────────────────────────────────────────────────
   -- Saving a flat is logged three different ways depending on which surface the
-  -- person used, and all three count.
+  -- person used, and all three count. Property ids are cast to text in the
+  -- union because these tables do not agree on whether one is a uuid.
   ts := '{}'; froms := '{}';
 
   c_who  := public._mkt_col('user_actions', 'user_id', 'customer_id');
@@ -448,17 +483,16 @@ begin
   c_what := public._mkt_col('user_actions', 'property_id', 'listing_id');
   c_act  := public._mkt_col('user_actions', 'action', 'event', 'type');
   if c_who is not null and c_when is not null and c_act is not null then
+    eq    := public._mkt_owner_eq('user_actions', c_who, 'a');
     ts    := ts    || format($q$(select min(a.%I) from public.user_actions a
-                                  where a.%I = p_user
-                                    and a.%I ~* 'shortlist|save|like|favou?rite')$q$,
-                             c_when, c_who, c_act);
+                                  where %s and a.%I ~* 'shortlist|save|like|favou?rite')$q$,
+                             c_when, eq, c_act);
     froms := froms || format('user_actions.%s', c_act);
     if c_what is not null then
-      ids := ids || format($q$select a.%I as pid from public.user_actions a
-                             where a.%I = p_user
-                               and a.%I ~* 'shortlist|save|like|favou?rite'
+      ids := ids || format($q$select a.%I::text as pid from public.user_actions a
+                             where %s and a.%I ~* 'shortlist|save|like|favou?rite'
                                and a.%I is not null$q$,
-                           c_what, c_who, c_act, c_what);
+                           c_what, eq, c_act, c_what);
     end if;
   end if;
 
@@ -466,12 +500,11 @@ begin
   c_when := public._mkt_col('saved_properties', 'created_at', 'saved_at', 'inserted_at', 'updated_at');
   c_what := public._mkt_col('saved_properties', 'listing_id', 'property_id', 'flat_id');
   if c_who is not null and c_when is not null then
-    ts    := ts    || format('(select min(sp.%I) from public.saved_properties sp where sp.%I = p_user)',
-                             c_when, c_who);
+    eq    := public._mkt_owner_eq('saved_properties', c_who, 'sp');
+    ts    := ts    || format('(select min(sp.%I) from public.saved_properties sp where %s)', c_when, eq);
     froms := froms || format('saved_properties.%s', c_who);
     if c_what is not null then
-      ids := ids || format('select sp.%I as pid from public.saved_properties sp where sp.%I = p_user',
-                           c_what, c_who);
+      ids := ids || format('select sp.%I::text as pid from public.saved_properties sp where %s', c_what, eq);
     end if;
   end if;
 
@@ -480,14 +513,13 @@ begin
   c_what := public._mkt_col('listing_reactions', 'property_id', 'listing_id');
   if c_who is not null and c_when is not null
      and public._mkt_col('listing_reactions', 'reaction') is not null then
+    eq    := public._mkt_owner_eq('listing_reactions', c_who, 'lr');
     ts    := ts    || format($q$(select min(lr.%I) from public.listing_reactions lr
-                                  where lr.%I = p_user and lr.reaction = 'like')$q$,
-                             c_when, c_who);
+                                  where %s and lr.reaction = 'like')$q$, c_when, eq);
     froms := froms || 'listing_reactions.reaction'::text;
     if c_what is not null then
-      ids := ids || format($q$select lr.%I as pid from public.listing_reactions lr
-                             where lr.%I = p_user and lr.reaction = 'like'$q$,
-                           c_what, c_who);
+      ids := ids || format($q$select lr.%I::text as pid from public.listing_reactions lr
+                             where %s and lr.reaction = 'like'$q$, c_what, eq);
     end if;
   end if;
 
@@ -522,13 +554,15 @@ begin
   expr   := null;
 
   if c_who is not null and c_when is not null then
-    expr  := format('public.visit_bookings v where v.%I = p_user', c_who);
+    expr  := format('public.visit_bookings v where %s',
+                    public._mkt_owner_eq('visit_bookings', c_who, 'v'));
     froms := array['visit_bookings'];
   else
     c_who  := public._mkt_col('visit_requests', 'customer_id', 'user_id');
     c_when := public._mkt_col('visit_requests', 'created_at', 'inserted_at');
     if c_who is not null and c_when is not null then
-      expr  := format('public.visit_requests v where v.%I = p_user', c_who);
+      expr  := format('public.visit_requests v where %s',
+                      public._mkt_owner_eq('visit_requests', c_who, 'v'));
       froms := array['visit_requests (the ask, not a booking)'];
     end if;
   end if;
@@ -577,12 +611,19 @@ begin
                                from public.user_profiles up where up.id = p_user)$q$, c_when);
   froms  := froms || 'user_profiles.search_status'::text;
 
-  c_who := public._mkt_col('crm_clients', 'user_id');
-  if c_who is not null
-     and public._mkt_col('crm_clients', 'status') is not null
-     and public._mkt_col('crm_clients', 'closed_at') is not null then
+  -- Both crm expressions below name status and closed_at, not just the column
+  -- each one returns — so they share one gate. Guarding the reason expression
+  -- on closed_reason alone was a real bug: a crm_clients with a reason but no
+  -- status compiled a function referencing a column that wasn't there.
+  c_who  := public._mkt_col('crm_clients', 'user_id');
+  crm_ok := c_who is not null
+            and public._mkt_col('crm_clients', 'status') is not null
+            and public._mkt_col('crm_clients', 'closed_at') is not null;
+
+  if crm_ok then
+    eq    := public._mkt_owner_eq('crm_clients', c_who, 'cc');
     ts    := ts    || format($q$(select min(cc.closed_at) from public.crm_clients cc
-                                  where cc.%I = p_user and cc.status = 'closed_by_us')$q$, c_who);
+                                  where %s and cc.status = 'closed_by_us')$q$, eq);
     froms := froms || 'crm_clients.status'::text;
   end if;
 
@@ -594,10 +635,11 @@ begin
 
   ts := array[$q$(select nullif(up.search_closed_reason, '')
                     from public.user_profiles up where up.id = p_user)$q$::text];
-  if c_who is not null and public._mkt_col('crm_clients', 'closed_reason') is not null then
+  if crm_ok and public._mkt_col('crm_clients', 'closed_reason') is not null then
     ts := ts || format($q$(select cc.closed_reason from public.crm_clients cc
-                            where cc.%I = p_user and cc.status = 'closed_by_us'
-                            order by cc.closed_at nulls last limit 1)$q$, c_who);
+                            where %s and cc.status = 'closed_by_us'
+                            order by cc.closed_at nulls last limit 1)$q$,
+                       public._mkt_owner_eq('crm_clients', c_who, 'cc'));
   end if;
 
   execute format($fn$
