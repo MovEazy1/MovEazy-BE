@@ -342,39 +342,87 @@ grant execute on function public.record_marketing_click(text, text, text, text, 
 -- ── Reporting ────────────────────────────────────────────────────────────────
 
 /**
- * The funnel steps, one small function each, built against the tables this
- * project actually has.
+ * The funnel steps, one small function each, built against the tables and
+ * columns this project actually has.
  *
  * The four middle steps are evidenced by tables that were introduced at
- * different times and are not all present in every environment — production had
- * no user_actions when this shipped. Naming a missing one directly would fail
- * the whole migration on a 42P01 and leave the project with no dashboards at
- * all, which is a far worse answer than a dashboard whose "Prop shortlisted"
- * column is honestly empty.
+ * different times, and the environments have drifted in two separate ways:
+ * production had no user_actions at all when this shipped, and its
+ * saved_properties has neither of the owner columns the repo's schema defines.
+ * Naming either directly fails the whole migration (42P01, then 42703) and
+ * leaves that project with no dashboards — a far worse answer than a dashboard
+ * whose "Prop shortlisted" column is honestly empty.
  *
- * So each helper's body is assembled from the sources that exist right now. Two
- * consequences worth knowing:
+ * So nothing here is assumed. Each source is resolved at apply time: does the
+ * table exist, and which of the plausible column spellings does it use. A
+ * source missing its table, or missing a column with no usable alternative, is
+ * dropped from that step's expression rather than breaking the file.
  *
- *   - Adding one of these tables later does NOT retroactively widen the
- *     helpers. Re-run this file after any such migration; it is idempotent and
- *     will pick the new source up.
+ * Two consequences worth knowing:
+ *
+ *   - Adding a table or column later does NOT retroactively widen the helpers.
+ *     Re-run this file after any such migration; it is idempotent and will
+ *     pick the new source up.
  *   - A step with no source at all reports null rather than zero-as-fact. The
  *     dashboard then shows nobody reaching it, which is true of what we can
- *     see, and the comment above says why.
+ *     see — and _mkt_build_log below records exactly which source answered for
+ *     each step, so a blank column is never mistaken for a dead channel.
  */
+
+/** The first of these column spellings that `p_table` actually has, or null. */
+create or replace function public._mkt_col(p_table text, variadic p_candidates text[])
+returns text
+language sql
+stable
+as $$
+  select c
+  from unnest(p_candidates) as c
+  where exists (
+    select 1
+    from pg_attribute a
+    where a.attrelid = to_regclass('public.' || p_table)
+      and a.attname = c
+      and a.attnum > 0
+      and not a.attisdropped
+  )
+  limit 1;
+$$;
+
+/** What each step resolved to, so the answer survives the SQL editor session. */
+create table if not exists public._mkt_build_log (
+  step      text primary key,
+  source    text not null,
+  built_at  timestamptz not null default now()
+);
+
 do $mig$
 declare
-  ts    text[] := '{}';   -- expressions for "when did this first happen"
-  ids   text[] := '{}';   -- branches of the "how many distinct properties" union
-  expr  text;
+  ts     text[] := '{}';   -- expressions for "when did this first happen"
+  ids    text[] := '{}';   -- branches of the "how many distinct properties" union
+  froms  text[] := '{}';   -- human-readable note of what answered, for the log
+  expr   text;
+  c_who  text;             -- the column naming the person
+  c_when text;             -- the column naming the moment
+  c_what text;             -- the column naming the property
+  c_act  text;             -- user_actions' "which action" column
 begin
-  -- Told us what they want: the guided Find My Flat questionnaire, or the
-  -- lighter search profile saved at signup. Either is a filled preference.
-  if to_regclass('public.user_requirements') is not null then
-    ts := ts || $q$(select min(r.created_at) from public.user_requirements r where r.user_id = p_user)$q$::text;
+  -- ── Pref filled ────────────────────────────────────────────────────────────
+  -- The guided Find My Flat questionnaire, or the lighter search profile saved
+  -- at signup. Either is a filled preference.
+  c_who  := public._mkt_col('user_requirements', 'user_id', 'id');
+  c_when := public._mkt_col('user_requirements', 'created_at', 'updated_at');
+  if c_who is not null and c_when is not null then
+    ts    := ts    || format('(select min(r.%I) from public.user_requirements r where r.%I = p_user)',
+                             c_when, c_who);
+    froms := froms || format('user_requirements.%s', c_when);
   end if;
-  if to_regclass('public.customer_search_profiles') is not null then
-    ts := ts || $q$(select min(s.updated_at) from public.customer_search_profiles s where s.user_id = p_user)$q$::text;
+
+  c_who  := public._mkt_col('customer_search_profiles', 'user_id', 'customer_id', 'id');
+  c_when := public._mkt_col('customer_search_profiles', 'updated_at', 'created_at');
+  if c_who is not null and c_when is not null then
+    ts    := ts    || format('(select min(s.%I) from public.customer_search_profiles s where s.%I = p_user)',
+                             c_when, c_who);
+    froms := froms || format('customer_search_profiles.%s', c_when);
   end if;
 
   expr := case when cardinality(ts) = 0 then 'null::timestamptz'
@@ -385,25 +433,62 @@ begin
     as $body$ select %s $body$;
   $fn$, expr);
 
+  insert into public._mkt_build_log (step, source, built_at)
+  values ('Pref filled',
+          coalesce(nullif(array_to_string(froms, ' + '), ''), 'no usable source'), now())
+  on conflict (step) do update set source = excluded.source, built_at = excluded.built_at;
+
+  -- ── Prop shortlisted ───────────────────────────────────────────────────────
   -- Saving a flat is logged three different ways depending on which surface the
   -- person used, and all three count.
-  ts := '{}';
-  if to_regclass('public.user_actions') is not null then
-    ts  := ts  || $q$(select min(a.created_at) from public.user_actions a
-                       where a.user_id = p_user and a.action ~* 'shortlist|save|like|favou?rite')$q$::text;
-    ids := ids || $q$select a.property_id as pid from public.user_actions a
-                      where a.user_id = p_user and a.action ~* 'shortlist|save|like|favou?rite'
-                        and a.property_id is not null$q$::text;
+  ts := '{}'; froms := '{}';
+
+  c_who  := public._mkt_col('user_actions', 'user_id', 'customer_id');
+  c_when := public._mkt_col('user_actions', 'created_at', 'inserted_at');
+  c_what := public._mkt_col('user_actions', 'property_id', 'listing_id');
+  c_act  := public._mkt_col('user_actions', 'action', 'event', 'type');
+  if c_who is not null and c_when is not null and c_act is not null then
+    ts    := ts    || format($q$(select min(a.%I) from public.user_actions a
+                                  where a.%I = p_user
+                                    and a.%I ~* 'shortlist|save|like|favou?rite')$q$,
+                             c_when, c_who, c_act);
+    froms := froms || format('user_actions.%s', c_act);
+    if c_what is not null then
+      ids := ids || format($q$select a.%I as pid from public.user_actions a
+                             where a.%I = p_user
+                               and a.%I ~* 'shortlist|save|like|favou?rite'
+                               and a.%I is not null$q$,
+                           c_what, c_who, c_act, c_what);
+    end if;
   end if;
-  if to_regclass('public.saved_properties') is not null then
-    ts  := ts  || $q$(select min(sp.created_at) from public.saved_properties sp where sp.customer_id = p_user)$q$::text;
-    ids := ids || $q$select sp.listing_id as pid from public.saved_properties sp where sp.customer_id = p_user$q$::text;
+
+  c_who  := public._mkt_col('saved_properties', 'customer_id', 'user_id', 'profile_id', 'uid');
+  c_when := public._mkt_col('saved_properties', 'created_at', 'saved_at', 'inserted_at', 'updated_at');
+  c_what := public._mkt_col('saved_properties', 'listing_id', 'property_id', 'flat_id');
+  if c_who is not null and c_when is not null then
+    ts    := ts    || format('(select min(sp.%I) from public.saved_properties sp where sp.%I = p_user)',
+                             c_when, c_who);
+    froms := froms || format('saved_properties.%s', c_who);
+    if c_what is not null then
+      ids := ids || format('select sp.%I as pid from public.saved_properties sp where sp.%I = p_user',
+                           c_what, c_who);
+    end if;
   end if;
-  if to_regclass('public.listing_reactions') is not null then
-    ts  := ts  || $q$(select min(lr.updated_at) from public.listing_reactions lr
-                       where lr.user_id = p_user and lr.reaction = 'like')$q$::text;
-    ids := ids || $q$select lr.property_id as pid from public.listing_reactions lr
-                      where lr.user_id = p_user and lr.reaction = 'like'$q$::text;
+
+  c_who  := public._mkt_col('listing_reactions', 'user_id', 'customer_id');
+  c_when := public._mkt_col('listing_reactions', 'updated_at', 'created_at');
+  c_what := public._mkt_col('listing_reactions', 'property_id', 'listing_id');
+  if c_who is not null and c_when is not null
+     and public._mkt_col('listing_reactions', 'reaction') is not null then
+    ts    := ts    || format($q$(select min(lr.%I) from public.listing_reactions lr
+                                  where lr.%I = p_user and lr.reaction = 'like')$q$,
+                             c_when, c_who);
+    froms := froms || 'listing_reactions.reaction'::text;
+    if c_what is not null then
+      ids := ids || format($q$select lr.%I as pid from public.listing_reactions lr
+                             where lr.%I = p_user and lr.reaction = 'like'$q$,
+                           c_what, c_who);
+    end if;
   end if;
 
   expr := case when cardinality(ts) = 0 then 'null::timestamptz'
@@ -423,32 +508,32 @@ begin
     as $body$ select %s $body$;
   $fn$, expr);
 
-  -- A booked slot is a scheduled visit. A tour request is only the ask, so it
-  -- is the fallback rather than an equal source — used only where the booking
-  -- table doesn't exist, and then said plainly rather than counted as more.
-  if to_regclass('public.visit_bookings') is not null then
-    execute $fn$
-      create or replace function public._mkt_visit_at(p_user uuid)
-      returns timestamptz language sql stable security definer set search_path = public
-      as $body$ select min(v.created_at) from public.visit_bookings v where v.user_id = p_user $body$;
-      $fn$;
-    execute $fn$
-      create or replace function public._mkt_visit_count(p_user uuid)
-      returns int language sql stable security definer set search_path = public
-      as $body$ select count(*)::int from public.visit_bookings v where v.user_id = p_user $body$;
-      $fn$;
-  elsif to_regclass('public.visit_requests') is not null then
-    execute $fn$
-      create or replace function public._mkt_visit_at(p_user uuid)
-      returns timestamptz language sql stable security definer set search_path = public
-      as $body$ select min(vr.created_at) from public.visit_requests vr where vr.customer_id = p_user $body$;
-      $fn$;
-    execute $fn$
-      create or replace function public._mkt_visit_count(p_user uuid)
-      returns int language sql stable security definer set search_path = public
-      as $body$ select count(*)::int from public.visit_requests vr where vr.customer_id = p_user $body$;
-      $fn$;
+  insert into public._mkt_build_log (step, source, built_at)
+  values ('Prop shortlisted',
+          coalesce(nullif(array_to_string(froms, ' + '), ''), 'no usable source'), now())
+  on conflict (step) do update set source = excluded.source, built_at = excluded.built_at;
+
+  -- ── Visit scheduled ────────────────────────────────────────────────────────
+  -- A booked slot is a scheduled visit. A tour request is only the ask, so it is
+  -- the fallback rather than an equal source — used only where the booking table
+  -- isn't usable, and then recorded in the log as what it is.
+  c_who  := public._mkt_col('visit_bookings', 'user_id', 'customer_id');
+  c_when := public._mkt_col('visit_bookings', 'created_at', 'inserted_at');
+  expr   := null;
+
+  if c_who is not null and c_when is not null then
+    expr  := format('public.visit_bookings v where v.%I = p_user', c_who);
+    froms := array['visit_bookings'];
   else
+    c_who  := public._mkt_col('visit_requests', 'customer_id', 'user_id');
+    c_when := public._mkt_col('visit_requests', 'created_at', 'inserted_at');
+    if c_who is not null and c_when is not null then
+      expr  := format('public.visit_requests v where v.%I = p_user', c_who);
+      froms := array['visit_requests (the ask, not a booking)'];
+    end if;
+  end if;
+
+  if expr is null then
     execute $fn$
       create or replace function public._mkt_visit_at(p_user uuid)
       returns timestamptz language sql stable security definer set search_path = public
@@ -459,18 +544,46 @@ begin
       returns int language sql stable security definer set search_path = public
       as $body$ select 0 $body$;
       $fn$;
+    froms := '{}';
+  else
+    execute format($fn$
+      create or replace function public._mkt_visit_at(p_user uuid)
+      returns timestamptz language sql stable security definer set search_path = public
+      as $body$ select min(v.%I) from %s $body$;
+    $fn$, c_when, expr);
+    execute format($fn$
+      create or replace function public._mkt_visit_count(p_user uuid)
+      returns int language sql stable security definer set search_path = public
+      as $body$ select count(*)::int from %s $body$;
+    $fn$, expr);
   end if;
 
-  -- Closed means the search ended with us, from either side of the house: the
-  -- flag the product writes on the profile, or the CRM marking the deal done.
-  -- 'closed_outside' is deliberately not counted — a channel does not get
-  -- credit for a person who rented somewhere else.
-  ts := array[$q$(select case when up.search_status = 'closed_by_us'
-                              then coalesce(up.search_closed_at, up.updated_at) end
-                    from public.user_profiles up where up.id = p_user)$q$::text];
-  if to_regclass('public.crm_clients') is not null then
-    ts := ts || $q$(select min(cc.closed_at) from public.crm_clients cc
-                     where cc.user_id = p_user and cc.status = 'closed_by_us')$q$::text;
+  insert into public._mkt_build_log (step, source, built_at)
+  values ('Visit scheduled',
+          coalesce(nullif(array_to_string(froms, ' + '), ''), 'no usable source'), now())
+  on conflict (step) do update set source = excluded.source, built_at = excluded.built_at;
+
+  -- ── Closed ─────────────────────────────────────────────────────────────────
+  -- The search ended with us, from either side of the house: the flag the
+  -- product writes on the profile, or the CRM marking the deal done.
+  -- 'closed_outside' is deliberately not counted — a channel does not get credit
+  -- for a person who rented somewhere else.
+  ts := '{}'; froms := '{}';
+
+  -- search_status and friends are added by this file, so they are always here.
+  c_when := public._mkt_col('user_profiles', 'updated_at', 'created_at');
+  ts     := ts || format($q$(select case when up.search_status = 'closed_by_us'
+                                         then coalesce(up.search_closed_at, up.%I) end
+                               from public.user_profiles up where up.id = p_user)$q$, c_when);
+  froms  := froms || 'user_profiles.search_status'::text;
+
+  c_who := public._mkt_col('crm_clients', 'user_id');
+  if c_who is not null
+     and public._mkt_col('crm_clients', 'status') is not null
+     and public._mkt_col('crm_clients', 'closed_at') is not null then
+    ts    := ts    || format($q$(select min(cc.closed_at) from public.crm_clients cc
+                                  where cc.%I = p_user and cc.status = 'closed_by_us')$q$, c_who);
+    froms := froms || 'crm_clients.status'::text;
   end if;
 
   execute format($fn$
@@ -481,10 +594,10 @@ begin
 
   ts := array[$q$(select nullif(up.search_closed_reason, '')
                     from public.user_profiles up where up.id = p_user)$q$::text];
-  if to_regclass('public.crm_clients') is not null then
-    ts := ts || $q$(select cc.closed_reason from public.crm_clients cc
-                     where cc.user_id = p_user and cc.status = 'closed_by_us'
-                     order by cc.closed_at nulls last limit 1)$q$::text;
+  if c_who is not null and public._mkt_col('crm_clients', 'closed_reason') is not null then
+    ts := ts || format($q$(select cc.closed_reason from public.crm_clients cc
+                            where cc.%I = p_user and cc.status = 'closed_by_us'
+                            order by cc.closed_at nulls last limit 1)$q$, c_who);
   end if;
 
   execute format($fn$
@@ -492,8 +605,16 @@ begin
     returns text language sql stable security definer set search_path = public
     as $body$ select coalesce(%s, '') $body$;
   $fn$, array_to_string(ts, ', '));
+
+  insert into public._mkt_build_log (step, source, built_at)
+  values ('Closed', array_to_string(froms, ' + '), now())
+  on conflict (step) do update set source = excluded.source, built_at = excluded.built_at;
 end;
 $mig$;
+
+-- Introspection and build metadata: useful to us, nothing the app should read.
+revoke all on function public._mkt_col(text, text[])     from public;
+alter table public._mkt_build_log enable row level security;
 
 revoke all on function public._mkt_prefs_at(uuid)        from public;
 revoke all on function public._mkt_shortlist_at(uuid)    from public;
@@ -829,18 +950,16 @@ values
 on conflict (slug) do nothing;
 
 -- ── Which funnel steps this project can actually see ─────────────────────────
--- Run this after applying. A 'missing' row is a column that will read empty on
--- every dashboard until that schema is applied and this file is re-run.
-select step, case when present then 'ok' else 'missing — apply its schema, then re-run this file' end as status
-from (values
-  ('Pref filled  (user_requirements)',      to_regclass('public.user_requirements')       is not null),
-  ('Pref filled  (customer_search_profiles)', to_regclass('public.customer_search_profiles') is not null),
-  ('Shortlisted  (user_actions)',           to_regclass('public.user_actions')            is not null),
-  ('Shortlisted  (saved_properties)',       to_regclass('public.saved_properties')        is not null),
-  ('Shortlisted  (listing_reactions)',      to_regclass('public.listing_reactions')       is not null),
-  ('Visit sched. (visit_bookings)',         to_regclass('public.visit_bookings')          is not null),
-  ('Closed       (crm_clients)',            to_regclass('public.crm_clients')             is not null)
-) as t(step, present);
+--
+-- Not a guess from to_regclass: this is what the DO block above resolved each
+-- step to on this database, written down as it built the functions. Anything
+-- reading 'no usable source' will be empty on every dashboard until the table
+-- behind it exists — apply that schema, then run this file again.
+select step, source, built_at
+  from public._mkt_build_log
+ order by case step
+            when 'Pref filled' then 1 when 'Prop shortlisted' then 2
+            when 'Visit scheduled' then 3 else 4 end;
 
 -- ── Check it landed ──────────────────────────────────────────────────────────
 --
