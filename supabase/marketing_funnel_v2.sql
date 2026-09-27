@@ -3,6 +3,9 @@
 --   Clicks | Visitors | Phone no. | Prop like/dislike | Pref given | Sign up |
 --   Visit scheduled | Closed
 --
+-- SUPERSEDED by marketing_people.sql, which defines the same funnel once for
+-- both the tiles and the people table. Run that instead.
+--
 -- Supersedes _marketing_stats, marketing_overview and marketing_channel_stats
 -- from marketing_schema.sql. IF YOU RE-RUN marketing_schema.sql, RE-RUN THIS
 -- FILE AFTER IT — that file drops and recreates these three functions in their
