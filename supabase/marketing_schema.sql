@@ -850,7 +850,14 @@ $$;
 
 revoke all on function public._marketing_leads(text) from public, anon, authenticated;
 
-/** Per-channel funnel totals. Internal; wrappers below do the permission check. */
+/**
+ * Per-channel funnel totals. Internal; wrappers below do the permission check.
+ *
+ * SUPERSEDED by marketing_funnel_v2.sql, which counts pre-signup leads and adds
+ * the phone and like/dislike steps. This older shape is kept so the file still
+ * builds from scratch — but if you re-run this file, re-run
+ * marketing_funnel_v2.sql straight after it, or the dashboards lose those steps.
+ */
 drop function if exists public._marketing_stats(text);
 create function public._marketing_stats(p_slug text default null)
 returns table (
