@@ -475,6 +475,19 @@ begin
     return;
   end if;
 
+  -- A flat its owner manages in the owner app (owner_schema.sql): brokers
+  -- reach MovEazy, never the owner. Nested ifs, not one condition: Postgres
+  -- does not promise to evaluate to_regclass first, and planning the exists
+  -- against a table that is not there would fail.
+  if v.source = 'moveazy' and to_regclass('public.owner_property_links') is not null then
+    if exists (select 1 from public.owner_property_links ol where ol.property_id = p_property) then
+      -- The team number in config/contactChannels.js (MOVEAZY_TEAM_WHATSAPP).
+      return query select 'owner'::text, 'MovEazy team'::text, '9146969162'::text,
+                          'Owner-managed via MovEazy'::text, ''::text, true;
+      return;
+    end if;
+  end if;
+
   if v.source = 'moveazy' and to_regclass('public.inventory_private') is null then
     -- No CRM internal details on this database: the poster is the contact.
     return query
