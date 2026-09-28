@@ -151,7 +151,8 @@ exception
 end;
 $$;
 
-revoke all on function public.admin_set_program_settings(jsonb) from public;
+-- Supabase grants anon every new function directly, not through public; take it back.
+revoke all on function public.admin_set_program_settings(jsonb) from public, anon;
 grant execute on function public.admin_set_program_settings(jsonb) to authenticated;
 
 commit;

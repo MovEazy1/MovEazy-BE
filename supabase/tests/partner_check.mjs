@@ -297,6 +297,7 @@ const pub = await as(db, anon, "select public.landing_settings() as s");
 check(pub.rows?.[0]?.s?.premiumPrice === 1499 && pub.rows[0].s.premiumListPrice === 10000 && Number(pub.rows[0].s.propertyShare) === 50,
   "anon reads the landing settings (1499 / 10000 / 50%)", pub.error?.message);
 check(denied(await as(db, anon, "select * from public.program_settings")), "anon cannot read the table itself");
+check(denied(await as(db, anon, `select public.admin_set_program_settings('{"premiumPrice": 1}')`)), "anon cannot even call the settings writer");
 check(denied(await as(db, c, `select public.admin_set_program_settings('{"premiumPrice": 1}')`)), "a partner cannot change settings");
 check(denied(await as(db, staff, `select public.admin_set_program_settings('{"premiumPrice": 1}')`)), "plain staff cannot either");
 const bad = await as(db, manager, `select public.admin_set_program_settings('{"propertyShare": 150}')`);
