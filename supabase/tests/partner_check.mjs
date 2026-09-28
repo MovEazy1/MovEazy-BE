@@ -5,7 +5,9 @@
  *   - a group-only listing is seen by current group members and nobody else,
  *     and stops being seen the moment a member is removed;
  *   - MovEazy inventory is locked (no address, no contacts) until premium,
- *     and 100% brokerage once unlocked;
+ *     and the program's property share (program_settings) once unlocked;
+ *   - program settings: anyone reads them, only partners.manage writes them,
+ *     out-of-range values are refused, and a new share is live at once;
  *   - owner / tenant contacts reach only the listing broker and staff;
  *   - invites are single use and expire; auto-approve can be switched off;
  *   - the tables under the functions give a broker nothing directly.
@@ -146,6 +148,7 @@ console.log("on a database without inventory_private_read / lead_intake / crm_pr
   await bare.exec(file("inventory_schema.sql"));
   await bare.exec(CRM_INVENTORY);
   await bare.exec(file("inventory_public_columns.sql"));
+  await bare.exec(file("program_settings.sql"));
   const applied = await bare.exec(file("partner_schema.sql")).then(() => null, (e) => e);
   check(!applied, "partner_schema.sql applies on its own", applied?.message);
   await bare.exec(file("partner_schema.sql"));
@@ -174,6 +177,9 @@ await db.exec(CRM_INVENTORY);
 await db.exec(file("inventory_public_columns.sql"));
 await db.exec(file("crm_property_internal.sql"));
 await db.exec(file("inventory_private_read.sql"));
+await db.exec(file("program_settings.sql"));
+await db.exec(file("program_settings.sql"));
+check(true, "program_settings.sql applies, and re-applies over itself");
 await db.exec(file("partner_schema.sql"));
 await db.exec(file("partner_schema.sql"));
 check(true, "partner_schema.sql applies, and re-applies over itself");
@@ -275,15 +281,48 @@ console.log("\npremium");
 check(denied(await as(db, b, `select public.partner_admin_grant_tier('${C}', 'moveazy_inventory', 1)`)), "a partner cannot grant premium");
 await as(db, manager, `select public.partner_admin_grant_tier('${C}', 'moveazy_inventory', 1)`);
 const cPrem = (await as(db, c, "select * from public.partner_inventory() where property_id = 'MZ-MOVE01'")).rows?.[0];
-check(cPrem?.locked === false && cPrem.full_address === "27th Main, HSR" && Number(cPrem.brokerage_pct) === 100,
-  "with premium: unlocked, address shown, 100% brokerage", JSON.stringify(cPrem));
+check(cPrem?.locked === false && cPrem.full_address === "27th Main, HSR" && Number(cPrem.brokerage_pct) === 50,
+  "with premium: unlocked, address shown, the program's 50% brokerage", JSON.stringify(cPrem));
 const cMoveContacts = await as(db, c, "select name, phone from public.partner_property_contacts_for('MZ-MOVE01')");
 check(cMoveContacts.rows?.[0]?.phone === "9000011111", "and the owner's number from the CRM", JSON.stringify(cMoveContacts.rows));
 const me = (await as(db, c, "select public.partner_me() as m")).rows?.[0]?.m;
-check(me?.tiers?.moveazy_inventory?.active === true && me.tiers.moveazy_inventory.price_monthly === 2499, "partner_me reports the plan");
+check(me?.tiers?.moveazy_inventory?.active === true && me.tiers.moveazy_inventory.price_monthly === 1499, "partner_me reports the plan at the program price");
+check(Number(me?.property_share) === 50 && Number(me?.client_share) === 70, "and the program's shares", JSON.stringify(me));
 await as(db, manager, `select public.partner_admin_grant_tier('${C}', 'moveazy_inventory', 0)`);
 check((await as(db, c, "select locked from public.partner_inventory() where property_id = 'MZ-MOVE01'")).rows?.[0]?.locked === true,
   "revoking premium locks it again");
+
+console.log("\nprogram settings");
+const pub = await as(db, anon, "select public.landing_settings() as s");
+check(pub.rows?.[0]?.s?.premiumPrice === 1499 && pub.rows[0].s.premiumListPrice === 10000 && Number(pub.rows[0].s.propertyShare) === 50,
+  "anon reads the landing settings (1499 / 10000 / 50%)", pub.error?.message);
+check(denied(await as(db, anon, "select * from public.program_settings")), "anon cannot read the table itself");
+check(denied(await as(db, c, `select public.admin_set_program_settings('{"premiumPrice": 1}')`)), "a partner cannot change settings");
+check(denied(await as(db, staff, `select public.admin_set_program_settings('{"premiumPrice": 1}')`)), "plain staff cannot either");
+const bad = await as(db, manager, `select public.admin_set_program_settings('{"propertyShare": 150}')`);
+check(bad.error?.code === "22023", "a share over 100% is refused", bad.error?.message);
+const typo = await as(db, manager, `select public.admin_set_program_settings('{"premiumPrize": 999}')`);
+check(typo.error?.code === "22023", "an unknown key is refused, not ignored", typo.error?.message);
+const vid = await as(db, manager, `select public.admin_set_program_settings('{"videoOwner": "javascript:alert(1)"}')`);
+check(vid.error?.code === "22023", "a video link must be https", vid.error?.message);
+const set = await as(db, manager, `select public.admin_set_program_settings('{"propertyShare": 60, "premiumPrice": 1999, "statBrokers": "25+"}') as s`);
+check(Number(set.rows?.[0]?.s?.propertyShare) === 60 && set.rows[0].s.statBrokers === "25+" && set.rows[0].s.premiumListPrice === 10000,
+  "partners.manage updates a subset; the rest is kept", set.error?.message);
+await as(db, manager, `select public.partner_admin_grant_tier('${C}', 'moveazy_inventory', 1)`);
+const at60 = (await as(db, c, "select brokerage_pct from public.partner_inventory() where property_id = 'MZ-MOVE01'")).rows?.[0];
+check(Number(at60?.brokerage_pct) === 60, "the new share is live on MovEazy listings at once", JSON.stringify(at60));
+const tier = (await as(db, c, "select public.partner_me() as m")).rows?.[0]?.m?.tiers?.moveazy_inventory;
+check(tier?.price_monthly === 1999, "and the plan row follows the new price", JSON.stringify(tier));
+await as(db, manager, `select public.partner_admin_grant_tier('${C}', 'moveazy_inventory', 0)`);
+check(denied(await as(db, staff, `select public.partner_admin_set_client_share('${C}', 80)`)), "plain staff cannot set a broker's client share");
+check((await as(db, manager, `select public.partner_admin_set_client_share('${C}', 101)`)).error?.code === "22023", "a client share over 100% is refused");
+await as(db, manager, `select public.partner_admin_set_client_share('${C}', 80)`);
+check(Number((await as(db, c, "select public.partner_me() as m")).rows?.[0]?.m?.client_share) === 80, "a broker's own client share overrides the default");
+check(Number((await as(db, manager, `select client_share_pct from public.partner_admin_list() where user_id = '${C}'`)).rows?.[0]?.client_share_pct) === 80,
+  "and shows in the CRM list");
+await as(db, manager, `select public.partner_admin_set_client_share('${C}', null)`);
+check(Number((await as(db, c, "select public.partner_me() as m")).rows?.[0]?.m?.client_share) === 70, "clearing it goes back to the default");
+await as(db, manager, `select public.admin_set_program_settings('{"propertyShare": 50, "premiumPrice": 1499, "statBrokers": "20+"}')`);
 
 console.log("\nleaving a group");
 check(denied(await as(db, b, `select public.partner_remove_member('${g}', '${A}')`)), "nobody removes the owner");

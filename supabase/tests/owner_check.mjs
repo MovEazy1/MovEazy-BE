@@ -181,6 +181,7 @@ await db.exec(file("crm_property_internal.sql").replace(/public\.normalize_mobil
 await db.exec(file("visits_schema.sql"));
 await db.exec(file("poster_visit_slots.sql"));
 await db.exec(file("tenants_schema.sql"));
+await db.exec(file("program_settings.sql"));
 await db.exec(file("partner_schema.sql"));
 await db.exec(file("owner_schema.sql"));
 await db.exec(file("owner_schema.sql"));

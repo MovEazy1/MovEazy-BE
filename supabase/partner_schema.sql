@@ -2,7 +2,8 @@
 -- MovEazy Partners — the broker app (fe/src/pages/partners/*, fe/src/lib/partners*.js).
 --
 -- Run ONCE in the Supabase SQL editor, AFTER crm_schema.sql (is_super_admin,
--- has_admin_scope, is_crm_staff), inventory_schema.sql and customer_schema.sql.
+-- has_admin_scope, is_crm_staff), inventory_schema.sql, customer_schema.sql and
+-- program_settings.sql (the brokerage share on MovEazy listings, the price).
 -- Uses inventory_private (crm_property_internal.sql) when it exists; defines
 -- is_inventory_poster and normalize_mobile itself if their own files
 -- (inventory_private_read.sql, lead_intake.sql) have not been run — with the
@@ -18,8 +19,8 @@
 --   moveazy   every published listing MovEazy holds that the CRM has not
 --             switched off for partners (inventory.partner_visible). LOCKED
 --             unless they hold the moveazy_inventory tier: no address, no
---             contacts. Unlocked, the brokerage is 100% — the broker closes
---             without sharing with MovEazy.
+--             contacts. The broker keeps program_settings.property_share of
+--             the brokerage (50% by default, set in the CRM).
 --   broker    other partners' listings shared with "All MovEazy brokers".
 --   group     other partners' listings shared with a group the caller is a
 --             CURRENT member of. Leaving or being removed takes it away on the
@@ -70,12 +71,18 @@ create table if not exists public.partner_tiers (
 );
 insert into public.partner_tiers (tier, label, is_free, price_monthly, trial_price, description) values
   ('moveazy_inventory', 'MovEazy Premium', false, 2499, 999,
-   'Unlock 1000+ MovEazy listings updated daily, with owner contacts and 100% brokerage.'),
+   'Unlock 1000+ MovEazy listings updated daily, with owner contacts.'),
   ('broker_network', 'Broker network', true, 0, 0,
    'Listings other partners share with all MovEazy brokers.'),
   ('group_inventory', 'Group inventory', true, 0, 0,
    'Listings shared inside the groups you belong to.')
 on conflict (tier) do nothing;
+-- The price lives in program_settings (the CRM edits it there); the plan row mirrors it.
+update public.partner_tiers t
+   set price_monthly = s.premium_price, trial_price = s.premium_price,
+       description = replace(t.description, ' and 100% brokerage', '')
+  from public.program_settings s
+ where s.id = 1 and t.tier = 'moveazy_inventory';
 
 
 -- ── Partners ─────────────────────────────────────────────────────────────────
@@ -94,6 +101,15 @@ create table if not exists public.broker_partners (
   updated_at       timestamptz not null default now()
 );
 create index if not exists broker_partners_status_idx on public.broker_partners (status, created_at desc);
+-- Share of the brokerage this broker keeps on MovEazy clients; null = the
+-- program default (program_settings.client_share).
+alter table public.broker_partners add column if not exists client_share_pct numeric;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'broker_partners_client_share_range') then
+    alter table public.broker_partners
+      add constraint broker_partners_client_share_range check (client_share_pct between 0 and 100);
+  end if;
+end $$;
 
 create table if not exists public.partner_entitlements (
   id          uuid primary key default gen_random_uuid(),
@@ -382,7 +398,8 @@ as $$
     select auth.uid() as uid,
            public.is_crm_staff() as staff,
            public.is_approved_partner() as partner,
-           public.partner_has_tier('moveazy_inventory') as premium
+           public.partner_has_tier('moveazy_inventory') as premium,
+           (select ps.property_share from public.program_settings ps where ps.id = 1) as property_share
   ),
   my_groups as (
     select m.group_id from public.partner_group_members m, me where m.user_id = me.uid
@@ -417,7 +434,7 @@ as $$
          else 'broker' end,
     r.platform_pct is not null,
     r.visible_groups,
-    case when not r.is_partner_listing then 100
+    case when not r.is_partner_listing then me.property_share
          when r.pl_broker = me.uid then greatest(r.platform_pct, (select max(gs.share_pct) from public.partner_group_shares gs where gs.property_id = r.property_id))
          else greatest(r.platform_pct, r.best_group_pct) end,
     (not r.is_partner_listing and not me.premium),
@@ -548,6 +565,9 @@ as $$
     'partner', (select to_jsonb(p) from public.broker_partners p where p.user_id = auth.uid()),
     'staff', public.is_crm_staff(),
     'can_manage', public.has_admin_scope('partners.manage'),
+    'property_share', (select s.property_share from public.program_settings s where s.id = 1),
+    'client_share', coalesce((select p.client_share_pct from public.broker_partners p where p.user_id = auth.uid()),
+                             (select s.client_share from public.program_settings s where s.id = 1)),
     'tiers', coalesce((
       select jsonb_object_agg(t.tier, jsonb_build_object(
         'label', t.label, 'is_free', t.is_free, 'price_monthly', t.price_monthly,
@@ -878,7 +898,7 @@ drop function if exists public.partner_admin_list();
 create function public.partner_admin_list()
 returns table (user_id uuid, name text, phone text, email text, agency text, status text,
                created_at timestamptz, approved_at timestamptz, approved_by text,
-               listing_count int, group_count int, premium_until timestamptz)
+               listing_count int, group_count int, premium_until timestamptz, client_share_pct numeric)
 language sql
 stable
 security definer
@@ -888,7 +908,8 @@ as $$
          (select count(*)::int from public.partner_listings l where l.broker_id = p.user_id),
          (select count(*)::int from public.partner_group_members m where m.user_id = p.user_id),
          (select max(e.ends_at) from public.partner_entitlements e
-           where e.user_id = p.user_id and e.tier = 'moveazy_inventory' and now() < e.ends_at)
+           where e.user_id = p.user_id and e.tier = 'moveazy_inventory' and now() < e.ends_at),
+         p.client_share_pct
     from public.broker_partners p
    where public.is_crm_staff()
    order by case p.status when 'pending' then 0 when 'approved' then 1 else 2 end, p.created_at desc;
@@ -929,6 +950,24 @@ begin
   update public.partner_program_settings
      set auto_approve = p_on, updated_at = now(), updated_by = lower(coalesce(auth.jwt() ->> 'email', ''))
    where id = 1;
+end;
+$$;
+
+/** One broker's share on MovEazy clients; null goes back to the program default. */
+create or replace function public.partner_admin_set_client_share(p_user uuid, p_pct numeric)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.has_admin_scope('partners.manage') then
+    raise exception 'Not allowed.' using errcode = '42501';
+  end if;
+  if p_pct is not null and (p_pct < 0 or p_pct > 100) then
+    raise exception 'Brokerage share must be between 0 and 100.' using errcode = '22023';
+  end if;
+  update public.broker_partners set client_share_pct = p_pct, updated_at = now() where user_id = p_user;
 end;
 $$;
 
@@ -1062,7 +1101,8 @@ begin
     'public.partner_admin_list()',
     'public.partner_admin_set_status(uuid, text)',
     'public.partner_admin_set_auto_approve(boolean)',
-    'public.partner_admin_grant_tier(uuid, text, int)'
+    'public.partner_admin_grant_tier(uuid, text, int)',
+    'public.partner_admin_set_client_share(uuid, numeric)'
   ] loop
     execute format('revoke all on function %s from public, anon', f);
     execute format('grant execute on function %s to authenticated', f);
