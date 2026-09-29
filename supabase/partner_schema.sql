@@ -22,6 +22,8 @@
 --             contacts. The broker keeps program_settings.property_share of
 --             the brokerage (50% by default, set in the CRM).
 --   broker    other partners' listings shared with "All MovEazy brokers".
+--             Premium only (any active plan): a partner without one sees the
+--             app on demo data (fe/docs/PARTNERS_LAUNCH_PRD.md).
 --   group     other partners' listings shared with a group the caller is a
 --             CURRENT member of. Leaving or being removed takes it away on the
 --             next read; nothing is copied into the member's account.
@@ -460,8 +462,9 @@ as $$
       (not r.is_partner_listing and r.status = 'published' and (r.partner_visible or me.staff))
       -- Your own, in any state.
       or (r.is_partner_listing and r.pl_broker = me.uid)
-      -- Someone else's, shared with everyone or with a group you are in now.
-      or (r.is_partner_listing and r.status = 'published'
+      -- Someone else's, shared with everyone or with a group you are in now —
+      -- for partners on a plan.
+      or (r.is_partner_listing and r.status = 'published' and me.premium
           and (r.platform_pct is not null or r.best_group_pct is not null))
       -- Staff see every partner listing, group-only and paused ones included.
       or (r.is_partner_listing and me.staff)

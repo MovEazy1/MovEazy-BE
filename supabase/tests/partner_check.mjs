@@ -243,6 +243,9 @@ check(denied(await as(db, a, `select public.partner_set_sharing('MZ-GROUP1', nul
 await as(db, a, `insert into public.partner_property_contacts (property_id, role, name, phone) values ('MZ-GROUP1', 'owner', 'Prakash', '9123456789')`);
 
 console.log("\nwho sees what");
+// Other brokers' listings are for partners on a plan: A and B have one, C does not.
+await as(db, manager, `select public.partner_admin_grant_tier('${A}', 'moveazy_inventory', 1)`);
+await as(db, manager, `select public.partner_admin_grant_tier('${B}', 'moveazy_inventory', 1)`);
 const seenA = await as(db, a, "select * from public.partner_inventory()");
 check(ids(seenA) === "MZ-GROUP1,MZ-MOVE01,MZ-ONLYME,MZ-PLAT01", "A: own three + MovEazy (not hidden, not paused)", ids(seenA) || seenA.error?.message);
 const seenB = await as(db, b, "select * from public.partner_inventory()");
@@ -251,7 +254,7 @@ const bGroup = seenB.rows?.find((r) => r.property_id === "MZ-GROUP1");
 check(bGroup?.source === "broker" && Number(bGroup.brokerage_pct) === 50 && bGroup.group_ids?.[0] === g && bGroup.lister_name === "Asha",
   "B sees the group listing at the group's 50%, credited to Asha", JSON.stringify(bGroup));
 const seenC = await as(db, c, "select * from public.partner_inventory()");
-check(ids(seenC) === "MZ-MOVE01,MZ-PLAT01", "C (outside the group): platform + MovEazy only", ids(seenC));
+check(ids(seenC) === "MZ-MOVE01", "C (outside the group, no plan): MovEazy only; the broker network needs a plan", ids(seenC));
 const move = seenC.rows?.find((r) => r.property_id === "MZ-MOVE01");
 check(move?.locked === true && move.full_address === "" && move.latitude === null && move.lister_phone === null,
   "MovEazy listing is locked for C: no address, no pin, no phone", JSON.stringify(move));
@@ -283,6 +286,7 @@ await as(db, manager, `select public.partner_admin_grant_tier('${C}', 'moveazy_i
 const cPrem = (await as(db, c, "select * from public.partner_inventory() where property_id = 'MZ-MOVE01'")).rows?.[0];
 check(cPrem?.locked === false && cPrem.full_address === "27th Main, HSR" && Number(cPrem.brokerage_pct) === 50,
   "with premium: unlocked, address shown, the program's 50% brokerage", JSON.stringify(cPrem));
+check(ids(await as(db, c, "select * from public.partner_inventory()")).includes("MZ-PLAT01"), "and the broker network appears (still not the group)");
 const cMoveContacts = await as(db, c, "select name, phone from public.partner_property_contacts_for('MZ-MOVE01')");
 check(cMoveContacts.rows?.[0]?.phone === "9000011111", "and the owner's number from the CRM", JSON.stringify(cMoveContacts.rows));
 const me = (await as(db, c, "select public.partner_me() as m")).rows?.[0]?.m;
