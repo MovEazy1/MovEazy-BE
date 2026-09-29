@@ -99,6 +99,8 @@ check(k.rows?.[0]?.score === 25, "no verified mobile on file: those 10 points ar
 
 console.log("\nbad values are refused");
 check(!!(await as(db, riya, `update public.tenant_profiles set linkedin = 'https://www.linkedin.com/company/swiggy'`)).error, "a LinkedIn company page is not a profile");
+check(!(await as(db, riya, `update public.tenant_profiles set linkedin = 'https://www.linkedin.com/in/%E0%A4%B0%E0%A4%BF%E0%A4%AF%E0%A4%BE-sharma'`)).error,
+  "an ID in another script, percent-encoded, is fine");
 check(!!(await as(db, riya, `update public.tenant_profiles set marital_status = 'complicated'`)).error, "an unknown status");
 check(!!(await as(db, riya, `update public.tenant_profiles set graduation_year = 1800`)).error, "a graduation year from 1800");
 

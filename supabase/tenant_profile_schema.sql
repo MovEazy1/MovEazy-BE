@@ -27,7 +27,7 @@ begin;
 
 create table if not exists public.tenant_profiles (
   user_id            uuid primary key references auth.users (id) on delete cascade,
-  linkedin           text not null default '' check (linkedin = '' or linkedin ~* '^https://www\.linkedin\.com/in/[A-Za-z0-9_%-]{3,100}$'),
+  linkedin           text not null default '',
   current_company    text not null default '' check (length(current_company) <= 120),
   past_company       text not null default '' check (length(past_company) <= 120),
   first_job          boolean not null default false,   -- "this is my first job" stands in for a past company
@@ -39,6 +39,12 @@ create table if not exists public.tenant_profiles (
   created_at         timestamptz not null default now(),
   updated_at         timestamptz not null default now()
 );
+
+-- A LinkedIn profile link, canonical (the app writes it so): IDs in other
+-- scripts arrive percent-encoded, hence the room.
+alter table public.tenant_profiles drop constraint if exists tenant_profiles_linkedin_check;
+alter table public.tenant_profiles add constraint tenant_profiles_linkedin_check
+  check (linkedin = '' or (length(linkedin) <= 450 and linkedin ~* '^https://www\.linkedin\.com/in/[A-Za-z0-9_%-]{3,}$'));
 
 /** The score for one profile, given the tenant's name and mobile. */
 create or replace function public.tenant_profile_score(p public.tenant_profiles, p_name text, p_phone text)
