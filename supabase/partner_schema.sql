@@ -225,6 +225,11 @@ begin
   end if;
 end $$;
 
+-- '' or 'potentially_rented' — a group member said it's gone and the listing
+-- broker hasn't confirmed yet (partner_launch.sql § 9). Public, like the rest.
+alter table public.inventory add column if not exists rent_flag text not null default '';
+grant select (rent_flag) on public.inventory to anon, authenticated;
+
 -- property_type reads like every other public column: granted to both roles
 -- together, or a signed-out select naming it would fail the whole map.
 grant select (property_type) on public.inventory to anon, authenticated;
@@ -389,7 +394,8 @@ returns table (
   lister_agency   text,
   lister_phone    text,
   created_at      timestamptz,
-  updated_at      timestamptz
+  updated_at      timestamptz,
+  rent_flag       text
 )
 language sql
 stable
@@ -452,7 +458,7 @@ as $$
     case when r.is_partner_listing then coalesce(nullif(bp.name, ''), r.poster_name) end,
     case when r.is_partner_listing then bp.agency end,
     case when r.is_partner_listing then coalesce(nullif(bp.phone, ''), r.phone) end,
-    r.created_at, r.updated_at
+    r.created_at, r.updated_at, r.rent_flag
   from src r
   cross join me
   left join public.broker_partners bp on bp.user_id = r.pl_broker

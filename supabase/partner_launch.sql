@@ -748,3 +748,497 @@ begin
 end $$;
 
 commit;
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- § 8  Curated lists a broker sends a tenant; the tenant's swipes; broker
+--      notifications; tenants brought by brokers, kept out of MovEazy's leads.
+-- § 9  Sold out: any group member flags a listing; MovEazy and the listing
+--      broker are told; "potentially rented" until the listing broker (or
+--      MovEazy) decides. Nothing is ever deleted.
+-- ═════════════════════════════════════════════════════════════════════════════
+
+begin;
+
+-- ── § 8 Curated lists ────────────────────────────────────────────────────────
+-- Separate from MovEazy's own curated shares (crm_curated_shares): these are a
+-- broker's picks for a broker's tenant, and every row carries the broker.
+create table if not exists public.partner_curated_lists (
+  id           uuid primary key default gen_random_uuid(),
+  token        text not null unique default replace(gen_random_uuid()::text, '-', ''),
+  broker_id    uuid not null references auth.users (id) on delete cascade,
+  lead_id      uuid references public.partner_leads (id) on delete set null,
+  lead_name    text not null default '',
+  property_ids text[] not null check (cardinality(property_ids) between 1 and 30),
+  tenant_id    uuid,
+  created_at   timestamptz not null default now(),
+  opened_at    timestamptz,
+  open_count   int not null default 0
+);
+create index if not exists partner_curated_lists_broker_idx on public.partner_curated_lists (broker_id, created_at desc);
+
+create table if not exists public.partner_curated_actions (
+  list_id     uuid not null references public.partner_curated_lists (id) on delete cascade,
+  property_id text not null,
+  action      text not null check (action in ('liked', 'skipped')),
+  at          timestamptz not null default now(),
+  primary key (list_id, property_id)
+);
+
+-- A tenant a broker brought: unverified (they typed a number on a broker's
+-- link), attributed to that broker, and never a MovEazy lead.
+create table if not exists public.partner_tenants (
+  id           uuid primary key default gen_random_uuid(),
+  broker_id    uuid not null references auth.users (id) on delete cascade,
+  phone        text not null check (phone ~ '^[6-9][0-9]{9}$'),
+  name         text not null default '',
+  source       text not null default 'curated' check (source in ('curated', 'storefront')),
+  status       text not null default 'unverified' check (status in ('unverified', 'verified')),
+  created_at   timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  unique (broker_id, phone)
+);
+create index if not exists partner_tenants_phone_idx on public.partner_tenants (phone);
+
+create table if not exists public.partner_notifications (
+  id         bigint generated always as identity primary key,
+  broker_id  uuid not null references auth.users (id) on delete cascade,
+  kind       text not null check (kind in ('tenant_liked', 'storefront_like', 'sold_out_request', 'sold_out_decided')),
+  title      text not null,
+  body       text not null default '',
+  link       text not null default '',
+  created_at timestamptz not null default now(),
+  read_at    timestamptz
+);
+create index if not exists partner_notifications_broker_idx on public.partner_notifications (broker_id, created_at desc);
+
+-- MovEazy's own leads carry who they belong to: 'moveazy', or the broker's id
+-- when the number first came through that broker. The CRM lists 'moveazy' only.
+-- (Only where the CRM exists: crm_schema.sql.)
+create or replace function public.crm_clients_attribute()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  b uuid;
+begin
+  if new.attributed_to is distinct from 'moveazy' then return new; end if;
+  select t.broker_id into b from public.partner_tenants t
+   where t.phone = public.normalize_mobile(new.phone) and public.normalize_mobile(new.phone) <> ''
+   order by t.created_at limit 1;
+  if b is not null then new.attributed_to := b::text; end if;
+  return new;
+end;
+$$;
+do $$
+begin
+  if to_regclass('public.crm_clients') is not null then
+    execute 'alter table public.crm_clients add column if not exists attributed_to text not null default ''moveazy''';
+    execute 'drop trigger if exists crm_clients_attribute on public.crm_clients';
+    execute 'create trigger crm_clients_attribute before insert on public.crm_clients for each row execute function public.crm_clients_attribute()';
+  end if;
+end $$;
+
+/** A broker's curated list for one of their leads, from flats they can see. Premium only. */
+create or replace function public.partner_curated_create(p_lead uuid, p_properties text[])
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  ids   text[];
+  lname text;
+  rec   public.partner_curated_lists;
+begin
+  if not (public.is_approved_partner() and public.partner_has_tier('moveazy_inventory')) then
+    raise exception 'Curated lists come with a Premium plan.' using errcode = '42501';
+  end if;
+  select coalesce(array_agg(distinct p), '{}') into ids from unnest(coalesce(p_properties, '{}')) p;
+  if cardinality(ids) = 0 or cardinality(ids) > 30 then
+    raise exception 'Pick between 1 and 30 homes.' using errcode = '22023';
+  end if;
+  if exists (select unnest(ids) except select property_id from public.partner_inventory()) then
+    raise exception 'One of those homes is not in your inventory.' using errcode = '42501';
+  end if;
+  if p_lead is not null then
+    select name into lname from public.partner_leads where id = p_lead and broker_id = auth.uid();
+    if not found then raise exception 'That lead is not yours.' using errcode = '42501'; end if;
+  end if;
+  insert into public.partner_curated_lists (broker_id, lead_id, lead_name, property_ids)
+  values (auth.uid(), p_lead, coalesce(lname, ''), ids)
+  returning * into rec;
+  return jsonb_build_object('id', rec.id, 'token', rec.token, 'count', cardinality(ids));
+end;
+$$;
+
+/** The tenant's page, by the link's token. Public columns only; opening is counted. */
+create or replace function public.partner_curated_open(p_token text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  l public.partner_curated_lists;
+begin
+  select * into l from public.partner_curated_lists where token = p_token;
+  if l.id is null then return null; end if;
+  update public.partner_curated_lists
+     set open_count = open_count + 1, opened_at = coalesce(opened_at, now())
+   where id = l.id;
+  return jsonb_build_object(
+    'lead_name', l.lead_name,
+    'has_contact', l.tenant_id is not null,
+    'broker', (select jsonb_build_object('name', bp.name, 'agency', bp.agency, 'phone', bp.phone,
+                                         'photo_url', coalesce((select s.photo_url from public.partner_storefronts s where s.broker_id = bp.user_id), ''))
+                 from public.broker_partners bp where bp.user_id = l.broker_id),
+    'homes', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'property_id', i.property_id, 'title', i.title, 'area', i.area, 'rent', i.rent, 'deposit', i.deposit,
+               'flat_type', i.flat_type, 'bedrooms', i.bedrooms, 'bathrooms', i.bathrooms, 'furnishing', i.furnishing,
+               'property_type', i.property_type, 'available_from', i.available_from, 'images', i.images,
+               'cover_image_url', i.cover_image_url, 'description', i.description, 'status', i.status,
+               'action', (select a.action from public.partner_curated_actions a where a.list_id = l.id and a.property_id = i.property_id))
+             order by array_position(l.property_ids, i.property_id))
+        from public.inventory i where i.property_id = any (l.property_ids)), '[]'::jsonb)
+  );
+end;
+$$;
+
+/** Before swiping: the tenant's mobile (name optional). They become the broker's unverified tenant. */
+create or replace function public.partner_curated_contact(p_token text, p_phone text, p_name text default '')
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  l  public.partner_curated_lists;
+  ph text := public.normalize_mobile(p_phone);
+  t  uuid;
+begin
+  if ph = '' then raise exception 'Enter a valid 10-digit mobile number.' using errcode = '22023'; end if;
+  select * into l from public.partner_curated_lists where token = p_token;
+  if l.id is null then raise exception 'This list is no longer available.' using errcode = '22023'; end if;
+  insert into public.partner_tenants as pt (broker_id, phone, name, source)
+  values (l.broker_id, ph, left(trim(coalesce(p_name, '')), 120), 'curated')
+  on conflict (broker_id, phone) do update
+     set last_seen_at = now(), name = coalesce(nullif(left(trim(coalesce(p_name, '')), 120), ''), pt.name)
+  returning id into t;
+  update public.partner_curated_lists set tenant_id = t where id = l.id;
+  return true;
+end;
+$$;
+
+/** A swipe. A like tells the broker straight away. */
+create or replace function public.partner_curated_act(p_token text, p_property text, p_action text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  l  public.partner_curated_lists;
+  tn public.partner_tenants;
+  h  public.inventory;
+begin
+  select * into l from public.partner_curated_lists where token = p_token;
+  if l.id is null then raise exception 'This list is no longer available.' using errcode = '22023'; end if;
+  if l.tenant_id is null then raise exception 'Add your mobile number first.' using errcode = '42501'; end if;
+  if not (p_property = any (l.property_ids)) then raise exception 'That home is not on this list.' using errcode = '22023'; end if;
+  if p_action not in ('liked', 'skipped') then raise exception 'Unknown action.' using errcode = '22023'; end if;
+
+  insert into public.partner_curated_actions as a (list_id, property_id, action)
+  values (l.id, p_property, p_action)
+  on conflict (list_id, property_id) do update set action = excluded.action, at = now();
+
+  if p_action = 'liked' then
+    select * into tn from public.partner_tenants where id = l.tenant_id;
+    select * into h from public.inventory where property_id = p_property;
+    insert into public.partner_notifications (broker_id, kind, title, body, link)
+    values (l.broker_id, 'tenant_liked',
+            coalesce(nullif(tn.name, ''), nullif(l.lead_name, ''), 'Your tenant') || ' liked a home',
+            concat_ws(' · ', nullif(h.flat_type, ''), nullif(h.area, ''), case when h.rent > 0 then '₹' || to_char(h.rent, 'FM99,99,999') end)
+              || ' — ' || tn.phone,
+            '/curated/' || l.id::text);
+  end if;
+  return true;
+end;
+$$;
+
+/** A broker's lists, with what each tenant did. */
+create or replace function public.partner_curated_mine()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'id', l.id, 'token', l.token, 'lead_id', l.lead_id, 'lead_name', l.lead_name, 'created_at', l.created_at,
+           'opened_at', l.opened_at, 'open_count', l.open_count, 'property_ids', l.property_ids,
+           'tenant', (select jsonb_build_object('name', t.name, 'phone', t.phone) from public.partner_tenants t where t.id = l.tenant_id),
+           'actions', coalesce((select jsonb_object_agg(a.property_id, jsonb_build_object('action', a.action, 'at', a.at))
+                                  from public.partner_curated_actions a where a.list_id = l.id), '{}'::jsonb))
+           order by l.created_at desc), '[]'::jsonb)
+    from public.partner_curated_lists l where l.broker_id = auth.uid();
+$$;
+
+create or replace function public.partner_notifications_list()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select jsonb_build_object(
+    'unread', (select count(*) from public.partner_notifications where broker_id = auth.uid() and read_at is null),
+    'items', coalesce((select jsonb_agg(jsonb_build_object('id', n.id, 'kind', n.kind, 'title', n.title, 'body', n.body,
+                                                          'link', n.link, 'created_at', n.created_at, 'read', n.read_at is not null)
+                                        order by n.created_at desc)
+                         from (select * from public.partner_notifications where broker_id = auth.uid() order by created_at desc limit 100) n), '[]'::jsonb));
+$$;
+
+create or replace function public.partner_notifications_read()
+returns void
+language sql
+security definer
+set search_path = public
+as $$ update public.partner_notifications set read_at = now() where broker_id = auth.uid() and read_at is null; $$;
+
+-- A like on a broker's QR storefront also becomes their tenant and a notification.
+create or replace function public.partner_storefront_like_notify()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  up public.user_profiles;
+  h  public.inventory;
+  ph text;
+begin
+  select * into up from public.user_profiles where id = new.user_id;
+  ph := public.normalize_mobile(coalesce(up.phone, ''));
+  if ph <> '' then
+    insert into public.partner_tenants as pt (broker_id, phone, name, source)
+    values (new.broker_id, ph, left(coalesce(up.name, ''), 120), 'storefront')
+    on conflict (broker_id, phone) do update set last_seen_at = now();
+  end if;
+  select * into h from public.inventory where property_id = new.property_id;
+  insert into public.partner_notifications (broker_id, kind, title, body, link)
+  values (new.broker_id, 'storefront_like', coalesce(nullif(up.name, ''), 'A tenant') || ' liked a home on your QR page',
+          concat_ws(' · ', nullif(h.flat_type, ''), nullif(h.area, '')) || case when ph <> '' then ' — ' || ph else '' end, '/qr');
+  return new;
+end;
+$$;
+drop trigger if exists partner_storefront_like_notify on public.partner_storefront_likes;
+create trigger partner_storefront_like_notify after insert on public.partner_storefront_likes
+  for each row execute function public.partner_storefront_like_notify();
+
+/** CRM: every tenant brought by a broker, with the broker — never mixed into MovEazy's leads. */
+create or replace function public.crm_broker_leads()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_crm_staff() then raise exception 'CRM staff only.' using errcode = '42501'; end if;
+  return jsonb_build_object(
+    'tenants', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'id', t.id, 'name', t.name, 'phone', t.phone, 'source', t.source, 'status', t.status,
+               'created_at', t.created_at, 'last_seen_at', t.last_seen_at,
+               'broker_id', t.broker_id, 'broker', bp.name, 'broker_phone', bp.phone, 'broker_agency', bp.agency,
+               'likes', (select count(*) from public.partner_curated_actions a join public.partner_curated_lists l on l.id = a.list_id
+                          where l.tenant_id = t.id and a.action = 'liked')
+                        + (select count(*) from public.partner_storefront_likes sl join public.user_profiles up on up.id = sl.user_id
+                            where sl.broker_id = t.broker_id and public.normalize_mobile(up.phone) = t.phone))
+             order by t.last_seen_at desc)
+        from public.partner_tenants t left join public.broker_partners bp on bp.user_id = t.broker_id), '[]'::jsonb),
+    'attributed_clients', case when to_regclass('public.crm_clients') is null then 0
+                               else (select count(*) from public.crm_clients where attributed_to <> 'moveazy') end
+  );
+end;
+$$;
+
+-- ── § 9 Sold out ─────────────────────────────────────────────────────────────
+-- '' or 'potentially_rented'. Public, like the rest of a listing: the site
+-- shows the marker until the listing broker (or MovEazy) decides.
+alter table public.inventory add column if not exists rent_flag text not null default '';
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'inventory_rent_flag_check') then
+    alter table public.inventory add constraint inventory_rent_flag_check check (rent_flag in ('', 'potentially_rented'));
+  end if;
+end $$;
+grant select (rent_flag) on public.inventory to anon, authenticated;
+
+create table if not exists public.partner_soldout_requests (
+  id           uuid primary key default gen_random_uuid(),
+  property_id  text not null references public.inventory (property_id) on delete cascade,
+  requested_by uuid not null references auth.users (id) on delete cascade,
+  status       text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
+  note         text not null default '',
+  created_at   timestamptz not null default now(),
+  decided_at   timestamptz,
+  decided_by   text not null default ''
+);
+create unique index if not exists partner_soldout_one_pending on public.partner_soldout_requests (property_id) where status = 'pending';
+
+/**
+ * A partner who sees a listing through a group (or the network) says it's
+ * gone. The listing turns "potentially rented"; its broker is notified; MovEazy
+ * sees it in the CRM.
+ */
+create or replace function public.partner_mark_sold_out(p_property text, p_note text default '')
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  lister uuid;
+  h      public.inventory;
+  who    text;
+  req    public.partner_soldout_requests;
+begin
+  if not (public.is_approved_partner() and public.partner_has_tier('moveazy_inventory')) then
+    raise exception 'Marking sold out comes with a Premium plan.' using errcode = '42501';
+  end if;
+  if not exists (select 1 from public.partner_inventory() v where v.property_id = p_property and v.source <> 'mine') then
+    raise exception 'You can mark sold out only a listing shared with you.' using errcode = '42501';
+  end if;
+  select * into h from public.inventory where property_id = p_property;
+  if h.status <> 'published' then raise exception 'That listing is already off the market.' using errcode = '22023'; end if;
+  select broker_id into lister from public.partner_listings where property_id = p_property;
+  select name into who from public.broker_partners where user_id = auth.uid();
+
+  insert into public.partner_soldout_requests (property_id, requested_by, note)
+  values (p_property, auth.uid(), left(coalesce(p_note, ''), 300))
+  on conflict (property_id) where status = 'pending' do nothing
+  returning * into req;
+  if req.id is null then
+    return jsonb_build_object('ok', true, 'already', true);
+  end if;
+  update public.inventory set rent_flag = 'potentially_rented' where property_id = p_property;
+  if lister is not null then
+    insert into public.partner_notifications (broker_id, kind, title, body, link)
+    values (lister, 'sold_out_request', coalesce(nullif(who, ''), 'A broker') || ' says your listing is rented',
+            concat_ws(' · ', nullif(h.flat_type, ''), nullif(h.area, ''), p_property) || '. Confirm to mark it sold out.',
+            '/property/' || p_property);
+  end if;
+  return jsonb_build_object('ok', true, 'request', req.id);
+end;
+$$;
+
+/** The listing broker (or MovEazy staff with partners.manage) confirms or rejects. Never deletes. */
+create or replace function public.partner_decide_sold_out(p_property text, p_approve boolean)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  lister uuid;
+  req    public.partner_soldout_requests;
+  actor  text := coalesce(nullif(lower(auth.jwt() ->> 'email'), ''), auth.uid()::text);
+begin
+  select broker_id into lister from public.partner_listings where property_id = p_property;
+  if not (auth.uid() = lister or public.has_admin_scope('partners.manage') or public.is_super_admin()) then
+    raise exception 'Only the listing broker or MovEazy can decide this.' using errcode = '42501';
+  end if;
+  select * into req from public.partner_soldout_requests where property_id = p_property and status = 'pending';
+  if req.id is null then raise exception 'Nothing to decide.' using errcode = '22023'; end if;
+  update public.partner_soldout_requests
+     set status = case when p_approve then 'approved' else 'rejected' end, decided_at = now(), decided_by = left(actor, 120)
+   where id = req.id;
+  update public.inventory
+     set rent_flag = '', status = case when p_approve then 'rented' else status end, updated_at = now()
+   where property_id = p_property;
+  insert into public.partner_notifications (broker_id, kind, title, body, link)
+  values (req.requested_by, 'sold_out_decided',
+          case when p_approve then 'Marked sold out — thanks' else 'Still available' end,
+          p_property || case when p_approve then ' is off the market now.' else ' — the listing broker says it is still available.' end,
+          '/property/' || p_property);
+  return jsonb_build_object('ok', true, 'approved', p_approve);
+end;
+$$;
+
+/** CRM: sold-out flags waiting for a decision (and recent ones). */
+create or replace function public.crm_soldout_requests()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_crm_staff() then raise exception 'CRM staff only.' using errcode = '42501'; end if;
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+             'id', r.id, 'property_id', r.property_id, 'status', r.status, 'note', r.note, 'created_at', r.created_at,
+             'decided_at', r.decided_at, 'decided_by', r.decided_by,
+             'by', a.name, 'by_phone', a.phone, 'lister', b.name, 'lister_phone', b.phone,
+             'flat_type', i.flat_type, 'area', i.area, 'rent', i.rent) order by r.status = 'pending' desc, r.created_at desc)
+      from public.partner_soldout_requests r
+      join public.inventory i on i.property_id = r.property_id
+      left join public.broker_partners a on a.user_id = r.requested_by
+      left join public.partner_listings pl on pl.property_id = r.property_id
+      left join public.broker_partners b on b.user_id = pl.broker_id), '[]'::jsonb);
+end;
+$$;
+
+-- ── Row access (§ 8–9) ───────────────────────────────────────────────────────
+alter table public.partner_curated_lists    enable row level security;
+alter table public.partner_curated_actions  enable row level security;
+alter table public.partner_tenants          enable row level security;
+alter table public.partner_notifications    enable row level security;
+alter table public.partner_soldout_requests enable row level security;
+
+do $$
+declare t text;
+begin
+  foreach t in array array['partner_curated_lists', 'partner_curated_actions', 'partner_tenants', 'partner_notifications', 'partner_soldout_requests'] loop
+    execute format('drop policy if exists "staff read" on public.%I', t);
+    execute format('create policy "staff read" on public.%I for select to authenticated using (public.is_crm_staff())', t);
+  end loop;
+end $$;
+
+revoke all on public.partner_curated_lists, public.partner_curated_actions, public.partner_tenants,
+              public.partner_notifications, public.partner_soldout_requests from public, anon, authenticated;
+grant select on public.partner_curated_lists, public.partner_curated_actions, public.partner_tenants,
+                public.partner_notifications, public.partner_soldout_requests to authenticated;
+
+revoke all on function public.crm_clients_attribute() from public, anon, authenticated;
+revoke all on function public.partner_storefront_like_notify() from public, anon, authenticated;
+do $$
+declare f text;
+begin
+  foreach f in array array[
+    'public.partner_curated_create(uuid, text[])',
+    'public.partner_curated_open(text)',
+    'public.partner_curated_contact(text, text, text)',
+    'public.partner_curated_act(text, text, text)',
+    'public.partner_curated_mine()',
+    'public.partner_notifications_list()',
+    'public.partner_notifications_read()',
+    'public.crm_broker_leads()',
+    'public.partner_mark_sold_out(text, text)',
+    'public.partner_decide_sold_out(text, boolean)',
+    'public.crm_soldout_requests()'
+  ] loop
+    execute format('revoke all on function %s from public, anon', f);
+    execute format('grant execute on function %s to authenticated', f);
+  end loop;
+end $$;
+-- The tenant's three calls work signed out: the link is the key.
+grant execute on function public.partner_curated_open(text) to anon;
+grant execute on function public.partner_curated_contact(text, text, text) to anon;
+grant execute on function public.partner_curated_act(text, text, text) to anon;
+
+commit;
