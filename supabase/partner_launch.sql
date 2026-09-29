@@ -802,7 +802,7 @@ create index if not exists partner_tenants_phone_idx on public.partner_tenants (
 create table if not exists public.partner_notifications (
   id         bigint generated always as identity primary key,
   broker_id  uuid not null references auth.users (id) on delete cascade,
-  kind       text not null check (kind in ('tenant_liked', 'storefront_like', 'sold_out_request', 'sold_out_decided')),
+  kind       text not null,
   title      text not null,
   body       text not null default '',
   link       text not null default '',
@@ -888,6 +888,12 @@ begin
   update public.partner_curated_lists
      set open_count = open_count + 1, opened_at = coalesce(opened_at, now())
    where id = l.id;
+  -- The first open is news: the tenant is looking at the list right now.
+  if l.opened_at is null then
+    insert into public.partner_notifications (broker_id, kind, title, body, link)
+    values (l.broker_id, 'list_opened', coalesce(nullif(l.lead_name, ''), 'Your tenant') || ' opened your list',
+            cardinality(l.property_ids) || ' homes — likes and skips will show up here.', '/curated/' || l.id::text);
+  end if;
   return jsonb_build_object(
     'lead_name', l.lead_name,
     'has_contact', l.tenant_id is not null,
@@ -943,6 +949,9 @@ declare
   l  public.partner_curated_lists;
   tn public.partner_tenants;
   h  public.inventory;
+  was_done boolean;
+  n_liked int;
+  n_skipped int;
 begin
   select * into l from public.partner_curated_lists where token = p_token;
   if l.id is null then raise exception 'This list is no longer available.' using errcode = '22023'; end if;
@@ -950,6 +959,7 @@ begin
   if not (p_property = any (l.property_ids)) then raise exception 'That home is not on this list.' using errcode = '22023'; end if;
   if p_action not in ('liked', 'skipped') then raise exception 'Unknown action.' using errcode = '22023'; end if;
 
+  select count(*) = cardinality(l.property_ids) into was_done from public.partner_curated_actions where list_id = l.id;
   insert into public.partner_curated_actions as a (list_id, property_id, action)
   values (l.id, p_property, p_action)
   on conflict (list_id, property_id) do update set action = excluded.action, at = now();
@@ -963,6 +973,21 @@ begin
             concat_ws(' · ', nullif(h.flat_type, ''), nullif(h.area, ''), case when h.rent > 0 then '₹' || to_char(h.rent, 'FM99,99,999') end)
               || ' — ' || tn.phone,
             '/curated/' || l.id::text);
+  end if;
+
+  -- The whole list done: one summary of likes and skips.
+  if not was_done then
+    select count(*) filter (where action = 'liked'), count(*) filter (where action = 'skipped'), count(*) = cardinality(l.property_ids)
+      into n_liked, n_skipped, was_done
+      from public.partner_curated_actions where list_id = l.id;
+    if was_done then
+      select * into tn from public.partner_tenants where id = l.tenant_id;
+      insert into public.partner_notifications (broker_id, kind, title, body, link)
+      values (l.broker_id, 'list_done',
+              coalesce(nullif(tn.name, ''), nullif(l.lead_name, ''), 'Your tenant') || ' finished your list',
+              '♥ ' || n_liked || ' liked · ✕ ' || n_skipped || ' skipped — ' || coalesce(tn.phone, ''),
+              '/curated/' || l.id::text);
+    end if;
   end if;
   return true;
 end;
@@ -1240,5 +1265,199 @@ end $$;
 grant execute on function public.partner_curated_open(text) to anon;
 grant execute on function public.partner_curated_contact(text, text, text) to anon;
 grant execute on function public.partner_curated_act(text, text, text) to anon;
+
+commit;
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- § 10 The broker's leads dashboard: QR poster spots (so scans can be counted
+--      by area — a scan can't say where the poster is, the poster can), the
+--      insights read, and link-preview reads with no side effects.
+-- ═════════════════════════════════════════════════════════════════════════════
+
+begin;
+
+alter table public.partner_notifications drop constraint if exists partner_notifications_kind_check;
+alter table public.partner_notifications add constraint partner_notifications_kind_check
+  check (kind in ('tenant_liked', 'storefront_like', 'sold_out_request', 'sold_out_decided', 'list_opened', 'list_done'));
+
+-- Where a printed poster is pasted. Each spot gets its own QR (…/b/CODE?s=qr&p=spot).
+create table if not exists public.partner_qr_spots (
+  id         uuid primary key default gen_random_uuid(),
+  broker_id  uuid not null references auth.users (id) on delete cascade,
+  code       text not null unique check (code ~ '^[a-z2-9]{5}$'),
+  area       text not null check (length(trim(area)) between 2 and 80),
+  label      text not null default '' check (length(label) <= 80),
+  active     boolean not null default true,
+  created_at timestamptz not null default now()
+);
+create index if not exists partner_qr_spots_broker_idx on public.partner_qr_spots (broker_id, created_at desc);
+alter table public.partner_storefront_views add column if not exists spot_id uuid references public.partner_qr_spots (id) on delete set null;
+
+create or replace function public.partner_add_spot(p_area text, p_label text default '')
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  c   text;
+  i   int;
+  rec public.partner_qr_spots;
+begin
+  if not public.is_approved_partner() then raise exception 'Only approved partners have posters.' using errcode = '42501'; end if;
+  if length(trim(coalesce(p_area, ''))) < 2 then raise exception 'Pick the area where you will paste it.' using errcode = '22023'; end if;
+  for i in 1..25 loop
+    select string_agg(substr('abcdefghjkmnpqrstuvwxyz23456789', 1 + floor(random() * 31)::int, 1), '') into c from generate_series(1, 5);
+    begin
+      insert into public.partner_qr_spots (broker_id, code, area, label)
+      values (auth.uid(), c, left(trim(p_area), 80), left(trim(coalesce(p_label, '')), 80))
+      returning * into rec;
+      exit;
+    exception when unique_violation then c := null;
+    end;
+  end loop;
+  return jsonb_build_object('id', rec.id, 'code', rec.code, 'area', rec.area, 'label', rec.label);
+end;
+$$;
+
+create or replace function public.partner_remove_spot(p_id uuid)
+returns void
+language sql
+security definer
+set search_path = public
+as $$ update public.partner_qr_spots set active = false where id = p_id and broker_id = auth.uid(); $$;
+
+/** A visit, with the poster spot it was scanned from (if any). Replaces the 3-argument call. */
+create or replace function public.partner_storefront_view(p_code text, p_visitor text, p_source text, p_spot text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  bid uuid := public.storefront_broker(p_code);
+  who text := coalesce(auth.uid()::text, left(trim(coalesce(p_visitor, '')), 64));
+  sp  uuid;
+begin
+  if bid is null or bid = auth.uid() or length(who) < 8 then return; end if;
+  select s.id into sp from public.partner_qr_spots s where s.code = lower(trim(coalesce(p_spot, ''))) and s.broker_id = bid;
+  insert into public.partner_storefront_views (broker_id, visitor, source, user_id, spot_id)
+  values (bid, who, case when p_source = 'qr' or sp is not null then 'qr' else 'link' end, auth.uid(), sp)
+  on conflict (broker_id, visitor, day) do nothing;
+end;
+$$;
+
+/** The broker's dashboard: QR scans (by day and by area), leads, lists, what tenants like, and the latest activity. */
+create or replace function public.partner_insights()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  uid   uuid := auth.uid();
+  today date := (now() at time zone 'Asia/Kolkata')::date;
+begin
+  if not public.is_approved_partner() then raise exception 'Only approved partners have a dashboard.' using errcode = '42501'; end if;
+  return jsonb_build_object(
+    'storefront_code', (select code from public.partner_storefronts where broker_id = uid),
+    'scans_total', (select count(*) from public.partner_storefront_views where broker_id = uid and source = 'qr'),
+    'scans_week', (select count(*) from public.partner_storefront_views where broker_id = uid and source = 'qr' and day > today - 7),
+    'visitors_week', (select count(distinct visitor) from public.partner_storefront_views where broker_id = uid and day > today - 7),
+    'by_day', (select jsonb_agg(jsonb_build_object('day', d::date,
+                 'scans', (select count(*) from public.partner_storefront_views v where v.broker_id = uid and v.day = d::date and v.source = 'qr'),
+                 'visits', (select count(*) from public.partner_storefront_views v where v.broker_id = uid and v.day = d::date)) order by d)
+               from generate_series(today - 13, today, interval '1 day') d),
+    'by_area', coalesce((
+      select jsonb_agg(jsonb_build_object('area', area, 'scans', scans, 'week', week) order by scans desc)
+        from (select coalesce(s.area, 'Not tagged') as area, count(*) as scans, count(*) filter (where v.day > today - 7) as week
+                from public.partner_storefront_views v
+                left join public.partner_qr_spots s on s.id = v.spot_id
+               where v.broker_id = uid and v.source = 'qr'
+               group by 1) q), '[]'::jsonb),
+    'spots', coalesce((
+      select jsonb_agg(jsonb_build_object('id', s.id, 'code', s.code, 'area', s.area, 'label', s.label, 'created_at', s.created_at,
+               'scans', (select count(*) from public.partner_storefront_views v where v.spot_id = s.id)) order by s.created_at desc)
+        from public.partner_qr_spots s where s.broker_id = uid and s.active), '[]'::jsonb),
+    'leads', jsonb_build_object(
+      'total', (select count(*) from public.partner_leads where broker_id = uid) + (select count(*) from public.partner_tenants where broker_id = uid),
+      'new_week', (select count(*) from public.partner_leads where broker_id = uid and created_at > now() - interval '7 days')
+                  + (select count(*) from public.partner_tenants where broker_id = uid and created_at > now() - interval '7 days'),
+      'via_qr', (select count(*) from public.partner_tenants where broker_id = uid and source = 'storefront'),
+      'via_lists', (select count(*) from public.partner_tenants where broker_id = uid and source = 'curated')),
+    'lists', (select jsonb_build_object(
+                'sent', count(*), 'opened', count(*) filter (where l.opened_at is not null),
+                'liked', coalesce(sum((select count(*) from public.partner_curated_actions a where a.list_id = l.id and a.action = 'liked')), 0),
+                'skipped', coalesce(sum((select count(*) from public.partner_curated_actions a where a.list_id = l.id and a.action = 'skipped')), 0))
+              from public.partner_curated_lists l where l.broker_id = uid),
+    'top_liked', coalesce((
+      select jsonb_agg(jsonb_build_object('property_id', i.property_id, 'flat_type', i.flat_type, 'area', i.area, 'rent', i.rent,
+               'cover_image_url', i.cover_image_url, 'images', i.images, 'likes', q.likes, 'skips', q.skips) order by q.likes desc, q.skips)
+        from (select property_id, count(*) filter (where kind = 'like') as likes, count(*) filter (where kind = 'skip') as skips
+                from (select a.property_id, case when a.action = 'liked' then 'like' else 'skip' end as kind
+                        from public.partner_curated_actions a join public.partner_curated_lists l on l.id = a.list_id where l.broker_id = uid
+                      union all
+                      select sl.property_id, 'like' from public.partner_storefront_likes sl where sl.broker_id = uid) x
+               group by property_id
+               order by 2 desc, 3
+               limit 8) q
+        join public.inventory i on i.property_id = q.property_id), '[]'::jsonb),
+    'activity', coalesce((
+      select jsonb_agg(e order by e ->> 'at' desc) from (
+        select jsonb_build_object('kind', a.action, 'at', a.at, 'who', coalesce(nullif(t.name, ''), nullif(l.lead_name, ''), 'Tenant'),
+                                  'phone', t.phone, 'property_id', a.property_id, 'flat_type', i.flat_type, 'area', i.area,
+                                  'link', '/curated/' || l.id::text) as e
+          from public.partner_curated_actions a
+          join public.partner_curated_lists l on l.id = a.list_id and l.broker_id = uid
+          left join public.partner_tenants t on t.id = l.tenant_id
+          left join public.inventory i on i.property_id = a.property_id
+        union all
+        select jsonb_build_object('kind', 'liked', 'at', sl.created_at, 'who', coalesce(nullif(up.name, ''), 'Tenant'), 'phone', up.phone,
+                                  'property_id', sl.property_id, 'flat_type', i.flat_type, 'area', i.area, 'link', '/qr', 'via', 'qr')
+          from public.partner_storefront_likes sl
+          left join public.user_profiles up on up.id = sl.user_id
+          left join public.inventory i on i.property_id = sl.property_id
+         where sl.broker_id = uid
+        order by 1 desc
+        limit 30) q), '[]'::jsonb)
+  );
+end;
+$$;
+
+/** For link previews (Facebook, WhatsApp): who sent the list and how many homes — no side effects. */
+create or replace function public.partner_curated_preview(p_token text)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select jsonb_build_object(
+    'broker', bp.name, 'count', cardinality(l.property_ids),
+    'cover', (select coalesce(nullif(i.cover_image_url, ''), i.images[1]) from public.inventory i where i.property_id = l.property_ids[1]))
+    from public.partner_curated_lists l left join public.broker_partners bp on bp.user_id = l.broker_id
+   where l.token = p_token;
+$$;
+
+alter table public.partner_qr_spots enable row level security;
+drop policy if exists "staff read" on public.partner_qr_spots;
+create policy "staff read" on public.partner_qr_spots for select to authenticated using (public.is_crm_staff());
+revoke all on public.partner_qr_spots from public, anon, authenticated;
+grant select on public.partner_qr_spots to authenticated;
+
+do $$
+declare f text;
+begin
+  foreach f in array array[
+    'public.partner_add_spot(text, text)', 'public.partner_remove_spot(uuid)', 'public.partner_insights()',
+    'public.partner_storefront_view(text, text, text, text)', 'public.partner_curated_preview(text)'
+  ] loop
+    execute format('revoke all on function %s from public, anon', f);
+    execute format('grant execute on function %s to authenticated', f);
+  end loop;
+end $$;
+grant execute on function public.partner_storefront_view(text, text, text, text) to anon;
+grant execute on function public.partner_curated_preview(text) to anon;
 
 commit;

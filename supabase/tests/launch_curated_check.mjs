@@ -121,8 +121,15 @@ const mine = await J(db, a, "select public.partner_curated_mine()");
 check(mine?.[0]?.actions?.["MZ-A1"]?.action === "liked" && mine[0].actions["MZ-A2"].action === "skipped" && mine[0].tenant?.phone === "9876533333",
   "the broker sees each action and the tenant's number", JSON.stringify(mine?.[0]?.actions));
 const notes = await J(db, a, "select public.partner_notifications_list()");
-check(Number(notes?.unread) === 1 && notes.items[0].kind === "tenant_liked" && notes.items[0].body.includes("9876533333"),
-  "a like notifies the broker", JSON.stringify(notes));
+check(Number(notes?.unread) === 2 && notes.items[0].kind === "tenant_liked" && notes.items[0].body.includes("9876533333")
+  && notes.items[1].kind === "list_opened", "the first open and a like both notify the broker", JSON.stringify(notes));
+await as(db, anon, `select public.partner_curated_open('${list.token}')`);
+check(Number((await J(db, a, "select public.partner_notifications_list()"))?.unread) === 2, "a second open doesn't");
+await as(db, anon, `select public.partner_curated_act('${list.token}', 'MZ-A3', 'skipped')`);
+const done = (await J(db, a, "select public.partner_notifications_list()"))?.items?.[0];
+check(done?.kind === "list_done" && done.body.includes("1 liked") && done.body.includes("2 skipped"), "finishing the list sends one summary of likes and skips", JSON.stringify(done));
+await as(db, anon, `select public.partner_curated_act('${list.token}', 'MZ-A3', 'liked')`);
+check(Number(await J(db, staff, "select count(*) from public.partner_notifications where kind = 'list_done'")) === 1, "changing a swipe afterwards doesn't send another summary");
 await as(db, a, "select public.partner_notifications_read()");
 check(Number((await J(db, a, "select public.partner_notifications_list()"))?.unread) === 0, "…and reading clears the count");
 check((await J(db, b, "select public.partner_notifications_list()"))?.items?.length === 0, "nobody else sees them");
@@ -136,7 +143,7 @@ check(attr.find((r) => r.phone === "9876533333")?.attributed_to === A && attr.fi
   "a CRM lead whose number came through a broker is theirs; others are MovEazy's", JSON.stringify(attr));
 check(denied(await as(db, a, "select public.crm_broker_leads()")), "brokers can't read the CRM's broker leads");
 const bleads = await J(db, staff, "select public.crm_broker_leads()");
-check(bleads?.tenants?.[0]?.broker === "Asha" && Number(bleads.tenants[0].likes) === 1 && Number(bleads.attributed_clients) === 1,
+check(bleads?.tenants?.[0]?.broker === "Asha" && Number(bleads.tenants[0].likes) === 2 && Number(bleads.attributed_clients) === 1,
   "CRM staff see every broker tenant, with the broker and their likes", JSON.stringify(bleads));
 
 console.log("\n§ 8 storefront likes");
@@ -165,6 +172,32 @@ await as(db, c, "select public.partner_mark_sold_out('MZ-A2')");
 await as(db, manager, "select public.partner_decide_sold_out('MZ-A2', false)");
 const kept = (await db.query("select status, rent_flag from public.inventory where property_id = 'MZ-A2'")).rows[0];
 check(kept?.status === "published" && kept.rent_flag === "", "MovEazy can say it's still available: back to normal", JSON.stringify(kept));
+
+console.log("\n§ 10 poster spots and the dashboard");
+check(denied(await as(db, tenant, "select public.partner_add_spot('HSR Layout', 'x')")), "a tenant can't add a poster spot");
+const spot = await J(db, a, "select public.partner_add_spot('HSR Layout', '27th Main gate')");
+check(/^[a-z2-9]{5}$/.test(spot?.code || ""), "a spot gets a short code", JSON.stringify(spot));
+const spot2 = await J(db, a, "select public.partner_add_spot('Koramangala', 'Cafe board')");
+await as(db, anon, `select public.partner_storefront_view('${code}', 'device-000A', 'qr', '${spot.code}')`);
+await as(db, anon, `select public.partner_storefront_view('${code}', 'device-000B', 'link', '${spot.code}')`);
+await as(db, anon, `select public.partner_storefront_view('${code}', 'device-000C', 'qr', '${spot2.code}')`);
+await as(db, anon, `select public.partner_storefront_view('${code}', 'device-000D', 'qr', '')`);
+await as(db, anon, `select public.partner_storefront_view('${code}', 'device-000E', 'link', 'zzzzz')`);
+const ins = await J(db, a, "select public.partner_insights()");
+const byArea = Object.fromEntries((ins?.by_area || []).map((x) => [x.area, Number(x.scans)]));
+check(byArea["HSR Layout"] === 2 && byArea.Koramangala === 1 && byArea["Not tagged"] === 1, "scans by area: a spot's QR counts as a scan there; an unknown spot is just a link visit", JSON.stringify(ins?.by_area));
+check(Number(ins?.scans_week) === 4 && ins.by_day.length === 14, "scans this week, and 14 days by day", JSON.stringify([ins?.scans_week, ins?.by_day?.length]));
+check(ins?.spots?.find((x) => x.code === spot.code)?.scans === 2, "each spot shows its scans");
+check(ins?.top_liked?.[0]?.property_id === "MZ-A3" && Number(ins.top_liked[0].likes) === 2, "the most liked home first (a list like + a QR-page like)", JSON.stringify(ins?.top_liked?.map((x) => [x.property_id, x.likes, x.skips])));
+check(ins?.lists?.sent === 1 && ins.lists.opened === 1 && Number(ins.lists.liked) === 2 && Number(ins.lists.skipped) === 1, "list stats", JSON.stringify(ins?.lists));
+check((ins?.activity || []).some((e) => e.kind === "skipped") && (ins?.activity || []).some((e) => e.via === "qr"), "the activity feed has likes and skips, from lists and the QR page");
+check(denied(await as(db, tenant, "select public.partner_insights()")), "a tenant has no dashboard");
+await as(db, b, `select public.partner_remove_spot('${spot.id}')`);
+check((await J(db, a, "select public.partner_insights()"))?.spots?.length === 2, "nobody else can remove your spot");
+await as(db, a, `select public.partner_remove_spot('${spot.id}')`);
+check((await J(db, a, "select public.partner_insights()"))?.spots?.length === 1, "you can");
+const pv = await J(db, anon, `select public.partner_curated_preview('${list.token}')`);
+check(pv?.broker === "Asha" && pv.count === 3, "the link preview says who and how many, without counting an open", JSON.stringify(pv));
 
 console.log("\n§ 8–9 access");
 for (const t of ["partner_curated_lists", "partner_curated_actions", "partner_tenants", "partner_notifications", "partner_soldout_requests"]) {
