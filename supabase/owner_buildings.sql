@@ -50,6 +50,12 @@ create table if not exists public.owner_buildings (
   updated_at   timestamptz not null default now()
 );
 create index if not exists owner_buildings_owner_idx on public.owner_buildings (owner_id, created_at desc);
+-- A building the MovEazy team adds may not have its owner in the app yet: it
+-- carries their contact until they sign in (crm_onboarding.sql).
+alter table public.owner_buildings alter column owner_id drop not null;
+alter table public.owner_buildings add column if not exists owner_email text not null default '';
+alter table public.owner_buildings add column if not exists owner_phone text not null default '';
+alter table public.owner_buildings add column if not exists created_by text not null default '';
 create index if not exists owner_buildings_broker_idx on public.owner_buildings (broker_id);
 
 alter table public.inventory add column if not exists building_id uuid references public.owner_buildings (id) on delete set null;
@@ -571,8 +577,11 @@ begin
       select jsonb_agg(jsonb_build_object(
                'id', b.id, 'code', b.code, 'name', b.name, 'area', b.area, 'landmark', b.landmark, 'full_address', b.full_address,
                'status', b.status, 'created_at', b.created_at,
-               'owner', (select jsonb_build_object('name', o.name, 'phone', o.phone, 'email', o.email)
-                           from public.owner_accounts o where o.user_id = b.owner_id),
+               'owner', coalesce(
+                          (select jsonb_build_object('name', o.name, 'phone', o.phone, 'email', o.email, 'joined', true)
+                             from public.owner_accounts o where o.user_id = b.owner_id),
+                          case when b.owner_email <> '' or b.owner_phone <> '' then
+                            jsonb_build_object('name', '', 'phone', b.owner_phone, 'email', b.owner_email, 'joined', false) end),
                'broker_id', b.broker_id,
                'broker', (select jsonb_build_object('name', p.name, 'phone', p.phone, 'agency', p.agency)
                             from public.broker_partners p where p.user_id = b.broker_id),
