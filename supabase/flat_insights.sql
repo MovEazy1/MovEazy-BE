@@ -85,7 +85,10 @@ as $$
     'visits',   (select count(*) from public.visit_bookings b
                   where b.property_id = p_property and coalesce(b.status, '') not ilike 'cancel%')
               + (select count(*) from public.owner_building_leads bl
-                  where p_property = any(bl.property_ids) and bl.status <> 'cancelled' and bl.visit_at is not null),
+                  where p_property = any(bl.property_ids) and bl.status <> 'cancelled' and bl.visit_at is not null
+                    -- A signed-in request is also in the tenant's own visits: counted there, once.
+                    and not exists (select 1 from public.visit_bookings b
+                                      where b.user_id = bl.user_id and b.property_id = p_property)),
     'feedback', (select count(*) from public.flat_feedback f where f.property_id = p_property),
     'rating',   (select round(avg(f.rating)::numeric, 1) from public.flat_feedback f where f.property_id = p_property and f.rating is not null),
     'price_views', (select coalesce(jsonb_object_agg(v.price_view, v.n), '{}'::jsonb) from (
@@ -134,7 +137,8 @@ as $$
         select jsonb_build_object('name', case when p_with_contacts then bl.name else public.owner_display_name(bl.name) end, 'phone', case when p_with_contacts then bl.phone end,
                                   'at', bl.visit_at, 'status', bl.status, 'created_at', bl.created_at)
           from public.owner_building_leads bl
-         where i.property_id = any(bl.property_ids)) v), '[]'::jsonb),
+         where i.property_id = any(bl.property_ids)
+           and not exists (select 1 from public.visit_bookings b where b.user_id = bl.user_id and b.property_id = i.property_id)) v), '[]'::jsonb),
     'feedback', coalesce((
       select jsonb_agg(jsonb_build_object(
                'id', f.id, 'name', case when p_with_contacts then f.renter_name else public.owner_display_name(f.renter_name) end,

@@ -27,6 +27,7 @@ const file = (name) =>
 const O1 = "a1111111-0000-0000-0000-000000000001"; // Priya, owner
 const O2 = "a2222222-0000-0000-0000-000000000002"; // Om, another owner
 const R1 = "b1111111-0000-0000-0000-000000000003"; // Rahul, renter
+const R3 = "b3333333-0000-0000-0000-000000000013"; // Meera, renter who books through the building QR
 const S = "c1111111-0000-0000-0000-000000000005";  // CRM staff
 
 const ownerCheck = readFileSync(new URL("./owner_check.mjs", import.meta.url), "utf8");
@@ -65,6 +66,7 @@ const anon = { role: "anon" };
 const o1 = { uid: O1, email: "priya@example.com" };
 const o2 = { uid: O2, email: "om@example.com" };
 const renter = { uid: R1, email: "rahul@example.com" };
+const meera = { uid: R3, email: "meera@example.com" };
 const staff = { uid: S, email: "agent@moveazy.co.in", staff: true };
 
 const db = new PGlite();
@@ -96,6 +98,8 @@ await db.exec(file("flat_insights.sql"));
 check(true, "flat_insights.sql applies over the owner, partner and building schemas, and re-applies over itself");
 
 await db.exec(`
+insert into auth.users (id, email) values ('${R3}', 'meera@example.com');
+insert into public.user_profiles (id, email, name, phone) values ('${R3}', 'meera@example.com', 'Meera Nair', '9876544444');
 insert into auth.users (id, email) values
   ('${O1}', 'priya@example.com'), ('${O2}', 'om@example.com'), ('${R1}', 'rahul@example.com'), ('${S}', 'agent@moveazy.co.in');
 insert into public.user_profiles (id, email, name, phone) values
@@ -123,12 +127,12 @@ insert into public.visit_bookings (user_id, property_id, slot_at, status) values
 `);
 const bld = await J(db, o1, `select public.owner_building_save('{"name":"Sunrise"}')`);
 await as(db, o1, `select public.owner_building_set_flat('MZ-LIVE1', '${bld.id}', 1)`);
-await as(db, anon, `select public.building_request_visit('${bld.code}', 'visitor-0009', 'Meera Nair', '9876544444', '{MZ-LIVE1}', now() + interval '2 days', '')`);
+await as(db, meera, `select public.building_request_visit('${bld.code}', 'visitor-0009', 'Meera Nair', '9876544444', '{MZ-LIVE1}', now() + interval '2 days', '')`);
 
 const dash = await J(db, o1, "select public.owner_rent_dashboard()");
 const live = dash?.find((d) => d.property_id === "MZ-LIVE1")?.stats;
 check(live?.scans === 2 && live.opens === 3, "two QR scans (one visitor twice in a day counts once), three opens; her own don't count", JSON.stringify(live));
-check(live?.likes === 1 && live.visits === 2, "a like, and two visits: a booking and a request from the building QR", JSON.stringify(live));
+check(live?.likes === 1 && live.visits === 2, "a like, and two visits: Rahul's booking and Meera's from the building QR — counted once, not twice", JSON.stringify(live));
 check(dash?.find((d) => d.property_id === "MZ-PAUSE")?.stats?.scans === 0, "a paused flat's page counts nothing");
 check(dash?.length === 2 && !dash.some((d) => d.property_id === "MZ-OMFLT"), "her dashboard has her two flats, not Om's");
 check((await J(db, o2, "select public.owner_rent_dashboard()"))?.length === 1, "Om's has his one");

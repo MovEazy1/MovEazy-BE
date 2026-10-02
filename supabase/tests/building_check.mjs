@@ -33,6 +33,8 @@ const O2 = "a2222222-0000-0000-0000-000000000002"; // another owner
 const B = "d1111111-0000-0000-0000-000000000006";  // the partner MovEazy assigns
 const B2 = "d2222222-0000-0000-0000-000000000007"; // another partner
 const S = "c1111111-0000-0000-0000-000000000005";  // CRM staff
+const R1 = "f1111111-0000-0000-0000-000000000011"; // Ravi, renter — signed in, no mobile on his profile yet
+const R2 = "f2222222-0000-0000-0000-000000000012"; // Meera, renter — already a phone-only CRM lead
 
 const ownerCheck = readFileSync(new URL("./owner_check.mjs", import.meta.url), "utf8");
 const PRELUDE = ownerCheck.split("const PRELUDE = `")[1].split("`;")[0];
@@ -72,6 +74,8 @@ const o2 = { uid: O2, email: "om@example.com" };
 const broker = { uid: B, email: "bala@broker.in" };
 const broker2 = { uid: B2, email: "chetan@broker.in" };
 const staff = { uid: S, email: "agent@moveazy.co.in", staff: true };
+const ravi = { uid: R1, email: "ravi@example.com" };
+const meera = { uid: R2, email: "meera@example.com" };
 const manager = { ...staff, scopes: ["partners.manage"] };
 
 const db = new PGlite();
@@ -105,8 +109,9 @@ check(true, "owner_buildings.sql applies over the owner, partner and launch sche
 await db.exec(`
 insert into auth.users (id, email) values
   ('${O1}', 'priya@example.com'), ('${O2}', 'om@example.com'), ('${B}', 'bala@broker.in'), ('${B2}', 'chetan@broker.in'),
-  ('${S}', 'agent@moveazy.co.in');
+  ('${S}', 'agent@moveazy.co.in'), ('${R1}', 'ravi@example.com'), ('${R2}', 'meera@example.com');
 insert into public.user_profiles (id, email, name, phone) values
+  ('${R1}', 'ravi@example.com', 'Ravi Kumar', ''), ('${R2}', 'meera@example.com', 'Meera Nair', '9876544444'),
   ('${O1}', 'priya@example.com', 'Priya Kumar', '9876500001'), ('${O2}', 'om@example.com', 'Om Das', '9876500002'),
   ('${B}', 'bala@broker.in', 'Bala', '9876500006'), ('${B2}', 'chetan@broker.in', 'Chetan', '9876500007');
 `);
@@ -167,23 +172,32 @@ const st0 = (await J(db, o1, "select public.owner_buildings_list()"))?.[0]?.stat
 check(st0?.scans === 1 && st0?.visitors === 2, "one QR scan, two visitors; a second scan that day and her own don't count", JSON.stringify(st0));
 
 console.log("\nvisit requests");
-check(!!(await as(db, anon, `select public.building_request_visit('${code}', 'visitor-0001', 'Ravi', '12345', '{}', null, '')`)).error,
+check(denied(await as(db, anon, `select public.building_request_visit('${code}', 'visitor-0001', 'Ravi Kumar', '9876533333', '{MZ-F101}', null, '')`)),
+  "not signed in: asked to sign in with Google first");
+check(!!(await as(db, ravi, `select public.building_request_visit('${code}', 'visitor-0001', 'Ravi', '12345', '{}', null, '')`)).error,
   "a bad number: refused");
-check(!!(await as(db, anon, `select public.building_request_visit('${code}', 'visitor-0001', '', '9876533333', '{}', null, '')`)).error,
+check(!!(await as(db, ravi, `select public.building_request_visit('${code}', 'visitor-0001', '', '9876533333', '{}', null, '')`)).error,
   "no name: refused");
-check(!!(await as(db, anon, `select public.building_request_visit('${code}', 'visitor-0001', 'Ravi', '9876533333', '{}', now() - interval '2 days', '')`)).error,
+check(!!(await as(db, ravi, `select public.building_request_visit('${code}', 'visitor-0001', 'Ravi', '9876533333', '{}', now() - interval '2 days', '')`)).error,
   "a time in the past: refused");
-const r1 = await J(db, anon, `select public.building_request_visit('${code}', 'visitor-0001', 'Ravi Kumar', '+91 98765 33333',
+const r1 = await J(db, ravi, `select public.building_request_visit('${code}', 'visitor-0001', 'Ravi Kumar', '+91 98765 33333',
   '{MZ-F101,MZ-OM001}', now() + interval '2 days', 'Evening is best')`);
 check(r1?.id && r1.updated === false && r1.has_partner === false, "Ravi asks to visit (before a partner is assigned)", JSON.stringify(r1));
 const lead1 = (await db.query(`select * from public.owner_building_leads where id = '${r1?.id}'`)).rows[0];
 check(lead1?.phone === "9876533333" && lead1.property_ids.join() === "MZ-F101", "his number is cleaned; only flats in this building are kept", JSON.stringify(lead1));
-const r1b = await J(db, anon, `select public.building_request_visit('${code}', 'visitor-0001', 'Ravi Kumar', '9876533333', '{MZ-F102}', null, '')`);
+const r1b = await J(db, ravi, `select public.building_request_visit('${code}', 'visitor-0001', 'Ravi Kumar', '9876533333', '{MZ-F102}', null, '')`);
 check(r1b?.id === r1?.id && r1b.updated === true, "asking again updates the open request");
 const lead1b = (await db.query(`select property_ids, visit_at from public.owner_building_leads where id = '${r1?.id}'`)).rows[0];
 check(lead1b?.property_ids?.sort().join() === "MZ-F101,MZ-F102" && lead1b.visit_at, "adding a flat, keeping his time", JSON.stringify(lead1b));
-check(Number((await db.query("select count(*) n from public.crm_clients where phone = '9876533333' and source = 'building_qr'")).rows[0].n) === 1,
-  "MovEazy's CRM gets the number, once");
+check(lead1?.user_id === R1, "the request is saved against his account");
+const ravisClients = (await db.query(`select user_id, phone, source from public.crm_clients where user_id = '${R1}'`)).rows;
+check(ravisClients.length === 1 && ravisClients[0].phone === "9876533333" && ravisClients[0].source === "building_qr",
+  "he is one client in MovEazy's CRM, under his account", JSON.stringify(ravisClients));
+check((await db.query(`select phone from public.user_profiles where id = '${R1}'`)).rows[0].phone === "9876533333",
+  "his account keeps the number he gave (it had none)");
+const ravisVisits = (await db.query(`select property_id, status from public.visit_bookings where user_id = '${R1}' order by property_id`)).rows;
+check(ravisVisits.map((v) => `${v.property_id}:${v.status}`).join() === "MZ-F101:scheduled,MZ-F102:preference",
+  "each flat he picked is in his own visits — a time for the first, 'call me' for the second", JSON.stringify(ravisVisits));
 check(Number((await db.query("select count(*) n from public.partner_notifications")).rows[0].n) === 0, "no partner yet: nobody to notify");
 
 console.log("\nMovEazy assigns the partner");
@@ -198,10 +212,14 @@ check(bl?.leads?.length === 1 && bl.leads[0].phone === "9876533333" && bl.buildi
   "Bala sees the open request with the number, and the address to show", JSON.stringify(bl)?.slice(0, 200));
 check((await J(db, broker2, "select public.partner_building_leads()"))?.leads?.length === 0, "another partner sees nothing");
 
-const r2 = await J(db, anon, `select public.building_request_visit('${code}', 'visitor-0002', 'Meera Nair', '9876544444', '{MZ-F201}', now() + interval '1 day', '')`);
+await db.exec("insert into public.crm_clients (name, phone, source) values ('Meera', '9876544444', 'whatsapp')");
+const r2 = await J(db, meera, `select public.building_request_visit('${code}', 'visitor-0002', 'Meera Nair', '9876544444', '{MZ-F201}', now() + interval '1 day', '')`);
 const n2 = await J(db, broker, "select public.partner_notifications_list()");
 check(n2?.items?.[0]?.kind === "building_visit" && n2.items[0].body.includes("9876544444") && n2.items[0].link === "/building-leads",
   "a new request reaches Bala at once, with the number", JSON.stringify(n2?.items?.[0]));
+const meeraClients = (await db.query("select user_id, source from public.crm_clients where phone = '9876544444'")).rows;
+check(meeraClients.length === 1 && meeraClients[0].user_id === R2 && meeraClients[0].source === "whatsapp",
+  "her earlier phone-only lead becomes her account's — not a second client", JSON.stringify(meeraClients));
 const t2 = (await db.query("select source, status from public.partner_tenants where phone = '9876544444'")).rows[0];
 check(t2?.source === "building" && t2.status === "unverified", "and becomes his unverified tenant", JSON.stringify(t2));
 

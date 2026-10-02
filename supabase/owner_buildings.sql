@@ -105,6 +105,9 @@ create table if not exists public.owner_building_leads (
 );
 create index if not exists owner_building_leads_building_idx on public.owner_building_leads (building_id, created_at desc);
 create index if not exists owner_building_leads_broker_idx on public.owner_building_leads (broker_id, created_at desc);
+-- The account that asked (Google sign-in): the visit is theirs, and they are a client in the CRM.
+alter table public.owner_building_leads add column if not exists user_id uuid references auth.users (id) on delete set null;
+create index if not exists owner_building_leads_user_idx on public.owner_building_leads (user_id);
 
 create table if not exists public.owner_building_bookings (
   property_id text primary key references public.inventory (property_id) on delete cascade,
@@ -253,7 +256,7 @@ end;
 $$;
 
 /**
- * A renter asks to visit. Name and mobile (no OTP), the flats they want to see,
+ * A renter asks to visit, signed in with Google. Name and mobile, the flats they want to see,
  * and the time they would like — or none, and the broker calls to fix one.
  * The same number asking again while a visit is open updates that request.
  * The building's broker is told at once; MovEazy's CRM gets the number too.
@@ -268,6 +271,7 @@ security definer
 set search_path = public
 as $$
 declare
+  uid     uuid := auth.uid();
   b       public.owner_buildings%rowtype;
   ph      text := right(regexp_replace(coalesce(p_phone, ''), '\D', '', 'g'), 10);
   nm      text := left(trim(coalesce(p_name, '')), 80);
@@ -276,6 +280,9 @@ declare
   fresh   boolean := false;
   when_tx text;
 begin
+  -- A visit is booked by an account (Google sign-in), so it shows in the
+  -- tenant's visits and the tenant is a client in the CRM, not just a number.
+  if uid is null then raise exception 'Sign in with Google to book your visit.' using errcode = '42501'; end if;
   select * into b from public.owner_buildings where id = public.building_by_code(p_code);
   if b.id is null then raise exception 'This property is not taking visits right now.' using errcode = '22023'; end if;
   if ph !~ '^[6-9][0-9]{9}$' then raise exception 'Enter a 10-digit mobile number.' using errcode = '22023'; end if;
@@ -283,10 +290,9 @@ begin
   if p_visit_at is not null and (p_visit_at < now() - interval '15 minutes' or p_visit_at > now() + interval '60 days') then
     raise exception 'Pick a time in the next two months.' using errcode = '22023';
   end if;
-  -- Twenty requests an hour from one device is a script, not a renter.
+  -- Twenty requests an hour from one account is a script, not a renter.
   if (select count(*) from public.owner_building_leads
-       where visitor = left(coalesce(p_visitor, ''), 64) and coalesce(p_visitor, '') <> ''
-         and created_at > now() - interval '1 hour') >= 20 then
+       where user_id = uid and created_at > now() - interval '1 hour') >= 20 then
     raise exception 'Too many requests. Try again in a while.' using errcode = '54000';
   end if;
 
@@ -295,17 +301,17 @@ begin
    where i.building_id = b.id and i.property_id = any(coalesce(p_properties, '{}'));
 
   select id into lid from public.owner_building_leads
-   where building_id = b.id and phone = ph and status in ('new', 'confirmed')
+   where building_id = b.id and (user_id = uid or phone = ph) and status in ('new', 'confirmed')
    order by created_at desc limit 1;
 
   if lid is null then
-    insert into public.owner_building_leads (building_id, name, phone, property_ids, visit_at, note, broker_id, visitor)
-    values (b.id, nm, ph, flats, p_visit_at, left(coalesce(p_note, ''), 500), b.broker_id, left(coalesce(p_visitor, ''), 64))
+    insert into public.owner_building_leads (building_id, name, phone, property_ids, visit_at, note, broker_id, visitor, user_id)
+    values (b.id, nm, ph, flats, p_visit_at, left(coalesce(p_note, ''), 500), b.broker_id, left(coalesce(p_visitor, ''), 64), uid)
     returning id into lid;
     fresh := true;
   else
     update public.owner_building_leads set
-      name = nm,
+      name = nm, phone = ph, user_id = uid,
       property_ids = (select coalesce(array_agg(distinct x), '{}') from unnest(property_ids || flats) x),
       visit_at = coalesce(p_visit_at, visit_at),
       note = case when coalesce(p_note, '') <> '' then left(p_note, 500) else note end,
@@ -329,12 +335,33 @@ begin
               case when cardinality(flats) = 1 then '' else 's' end else '' end,
             '/building-leads');
   end if;
-  -- MovEazy's own copy of the lead, for the CRM pipeline (once per number).
-  if fresh and to_regclass('public.crm_clients') is not null then
-    execute 'insert into public.crm_clients (name, phone, source)
-             select $1, $2, ''building_qr''
-              where not exists (select 1 from public.crm_clients c where right(regexp_replace(coalesce(c.phone, ''''), ''\D'', '''', ''g''), 10) = $2)'
-      using nm, ph;
+
+  -- Their account keeps the number they gave, if it had none.
+  update public.user_profiles set phone = ph, name = case when coalesce(name, '') = '' then nm else name end
+   where id = uid and coalesce(trim(phone), '') = '';
+
+  -- MovEazy's client list: this account, as one client. A lead that came in by
+  -- this number before (no account then) becomes this account's.
+  if to_regclass('public.crm_clients') is not null then
+    execute 'update public.crm_clients c set user_id = $1
+              where c.user_id is null
+                and not exists (select 1 from public.crm_clients x where x.user_id = $1)
+                and c.id = (select y.id from public.crm_clients y
+                             where y.user_id is null and right(regexp_replace(coalesce(y.phone, ''''), ''\D'', '''', ''g''), 10) = $2
+                             limit 1)'
+      using uid, ph;
+    execute 'insert into public.crm_clients (user_id, name, phone, source)
+             select $1, $2, $3, ''building_qr''
+              where not exists (select 1 from public.crm_clients x where x.user_id = $1)'
+      using uid, nm, ph;
+  end if;
+
+  -- The tenant's own visits (and the CRM's Visits): one booking per flat they picked.
+  if cardinality(flats) > 0 and to_regclass('public.visit_bookings') is not null then
+    insert into public.visit_bookings (user_id, property_id, slot_at, kind, status)
+    select uid, f, p_visit_at, 'individual', case when p_visit_at is null then 'preference' else 'scheduled' end
+      from unnest(flats) f
+    on conflict (user_id, property_id) do update set slot_at = excluded.slot_at, status = excluded.status;
   end if;
 
   return jsonb_build_object('id', lid, 'updated', not fresh, 'has_partner', b.broker_id is not null);
