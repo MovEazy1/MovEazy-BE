@@ -1278,7 +1278,8 @@ begin;
 
 alter table public.partner_notifications drop constraint if exists partner_notifications_kind_check;
 alter table public.partner_notifications add constraint partner_notifications_kind_check
-  check (kind in ('tenant_liked', 'storefront_like', 'sold_out_request', 'sold_out_decided', 'list_opened', 'list_done'));
+  check (kind in ('tenant_liked', 'storefront_like', 'sold_out_request', 'sold_out_decided', 'list_opened', 'list_done',
+                  'building_visit', 'building_assigned'));  -- the last two: owner_buildings.sql
 
 -- Where a printed poster is pasted. Each spot gets its own QR (…/b/CODE?s=qr&p=spot).
 create table if not exists public.partner_qr_spots (
