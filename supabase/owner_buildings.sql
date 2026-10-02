@@ -56,12 +56,26 @@ alter table public.owner_buildings alter column owner_id drop not null;
 alter table public.owner_buildings add column if not exists owner_email text not null default '';
 alter table public.owner_buildings add column if not exists owner_phone text not null default '';
 alter table public.owner_buildings add column if not exists created_by text not null default '';
+-- 'building': one owner, who sees it in the owner app. 'society': each flat has
+-- its own owner, who sees only their flat; MovEazy runs the society's page.
+alter table public.owner_buildings add column if not exists kind text not null default 'building';
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'owner_buildings_kind_check') then
+    alter table public.owner_buildings add constraint owner_buildings_kind_check check (kind in ('building', 'society'));
+  end if;
+end $$;
+-- The video the QR page opens with (a walk-through of the building).
+alter table public.owner_buildings add column if not exists cover_video text not null default '';
 create index if not exists owner_buildings_broker_idx on public.owner_buildings (broker_id);
 
 alter table public.inventory add column if not exists building_id uuid references public.owner_buildings (id) on delete set null;
 alter table public.inventory add column if not exists floor_number int;
+-- The flat's number in its building ("302", "B-1104"), and where MovEazy wants
+-- it in the building's list (lower first; unset after the ordered ones).
+alter table public.inventory add column if not exists unit_no text not null default '';
+alter table public.inventory add column if not exists unit_order int;
 create index if not exists inventory_building_idx on public.inventory (building_id) where building_id is not null;
-grant select (building_id, floor_number) on public.inventory to anon, authenticated;
+grant select (building_id, floor_number, unit_no, unit_order) on public.inventory to anon, authenticated;
 
 create table if not exists public.owner_building_scans (
   building_id uuid not null references public.owner_buildings (id) on delete cascade,
@@ -187,9 +201,10 @@ as $$
            'bedrooms', i.bedrooms, 'bathrooms', i.bathrooms, 'furnishing', i.furnishing, 'rent', i.rent,
            'deposit', i.deposit, 'available_from', i.available_from, 'area_sqft', i.area_sqft,
            'floor_number', i.floor_number, 'images', i.images, 'cover_image_url', i.cover_image_url,
-           'amenities', i.amenities, 'description', i.description,
+           'amenities', i.amenities, 'description', i.description, 'unit_no', i.unit_no, 'unit_order', i.unit_order,
            'available', i.status <> 'rented' and not exists (select 1 from public.owner_building_bookings k where k.property_id = i.property_id))
-         order by i.floor_number nulls last, i.rent, i.property_id), '[]'::jsonb)
+         -- MovEazy's order first; then floor by floor, cheapest first.
+         order by i.unit_order nulls last, i.floor_number nulls last, i.rent, i.property_id), '[]'::jsonb)
     from public.inventory i
    where i.building_id = p_building and i.status in ('published', 'paused', 'rented');
 $$;
@@ -208,6 +223,7 @@ as $$
     'code', b.code, 'name', b.name, 'area', b.area, 'landmark', b.landmark,
     'latitude', round(b.latitude, 3), 'longitude', round(b.longitude, 3),   -- the neighbourhood, not the gate
     'total_floors', b.total_floors, 'description', b.description, 'amenities', b.amenities, 'photos', b.photos,
+    'kind', b.kind, 'cover_video', b.cover_video,
     'flats', public.building_flats(b.id),
     'has_partner', b.broker_id is not null
   )
@@ -339,7 +355,7 @@ as $$
            'id', b.id, 'code', b.code, 'name', b.name, 'area', b.area, 'landmark', b.landmark,
            'full_address', b.full_address, 'latitude', b.latitude, 'longitude', b.longitude,
            'total_floors', b.total_floors, 'description', b.description, 'amenities', b.amenities,
-           'photos', b.photos, 'status', b.status, 'created_at', b.created_at,
+           'photos', b.photos, 'status', b.status, 'created_at', b.created_at, 'kind', b.kind, 'cover_video', b.cover_video,
            'has_partner', b.broker_id is not null,
            'flats', (select count(*) from public.inventory i where i.building_id = b.id),
            'stats', public.building_stats(b.id))
@@ -387,6 +403,7 @@ begin
     description  = case when p ? 'description' then left(coalesce(p ->> 'description', ''), 2000) else b.description end,
     amenities    = case when p ? 'amenities' then array(select left(x, 60) from jsonb_array_elements_text(p -> 'amenities') x limit 40) else b.amenities end,
     photos       = case when p ? 'photos' then array(select x from jsonb_array_elements_text(p -> 'photos') x where x ~ '^https://' limit 30) else b.photos end,
+    cover_video  = case when p ? 'cover_video' and coalesce(p ->> 'cover_video', '') ~ '^(https://.*)?$' then coalesce(p ->> 'cover_video', '') else b.cover_video end,
     status       = case when p ->> 'status' in ('active', 'paused') then p ->> 'status' else b.status end,
     updated_at   = now()
   where b.id = bid;
@@ -430,6 +447,7 @@ as $$
     'id', b.id, 'code', b.code, 'name', b.name, 'area', b.area, 'landmark', b.landmark, 'full_address', b.full_address,
     'latitude', b.latitude, 'longitude', b.longitude, 'total_floors', b.total_floors, 'description', b.description,
     'amenities', b.amenities, 'photos', b.photos, 'status', b.status, 'has_partner', b.broker_id is not null,
+    'kind', b.kind, 'cover_video', b.cover_video,
     'stats', public.building_stats(b.id),
     'flats', public.building_flats(b.id),
     'booked', coalesce((select jsonb_agg(k.property_id) from public.owner_building_bookings k where k.building_id = b.id), '[]'::jsonb),
@@ -670,7 +688,8 @@ returns table (
   active_tenants  int,
   building_id     uuid,
   floor_number    int,
-  building_name   text
+  building_name   text,
+  unit_no         text
 )
 language sql
 stable
@@ -699,7 +718,7 @@ as $$
       where q.property_id = i.property_id and q.status not in ('resolved', 'cancelled')),
     (select count(*)::int from public.tenants t
       where t.property_id = i.property_id and t.poster_id = l.owner_id and t.status in ('active', 'invited')),
-    i.building_id, i.floor_number, ob.name
+    i.building_id, i.floor_number, ob.name, i.unit_no
   from public.owner_property_links l
   join public.inventory i on i.property_id = l.property_id
   left join public.owner_buildings ob on ob.id = i.building_id

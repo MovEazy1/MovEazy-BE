@@ -3,7 +3,8 @@
 -- when they sign in (fe/src/pages/crm/CrmPropertyForm.jsx).
 --
 -- Run in the Supabase SQL editor AFTER crm_property_internal.sql,
--- owner_schema.sql, partner_schema.sql and owner_buildings.sql. Safe to re-run.
+-- owner_schema.sql, partner_schema.sql, partner_storefront.sql and
+-- owner_buildings.sql. Safe to re-run.
 --
 -- The CRM form now asks two things of every upload: is the owner onboarded,
 -- and is the flat one of several units in a building. The owner's email and
@@ -76,8 +77,9 @@ begin
    where o.user_id = p_owner and o.status <> 'suspended';
   if not found then return 0; end if;
 
+  -- A building has one owner; a society's flats each belong to their own.
   update public.owner_buildings b set owner_id = p_owner, updated_at = now()
-   where b.owner_id is null and public.crm_contact_matches(b.owner_email, b.owner_phone, em, ph);
+   where b.owner_id is null and b.kind = 'building' and public.crm_contact_matches(b.owner_email, b.owner_phone, em, ph);
 
   insert into public.owner_property_links (property_id, owner_id, linked_by)
   select ip.property_id, p_owner, 'crm'
@@ -250,6 +252,7 @@ begin
     on conflict (property_id) do nothing;
     return new;
   end if;
+  if new.kind <> 'building' then return new; end if;
   for u in
     select o.user_id from public.owner_accounts o left join public.user_profiles p on p.id = o.user_id
      where o.status <> 'suspended'
@@ -299,7 +302,8 @@ begin
   if not public.is_crm_staff() then raise exception 'CRM staff only.' using errcode = '42501'; end if;
   return coalesce((
     select jsonb_agg(jsonb_build_object(
-             'id', b.id, 'code', b.code, 'name', b.name, 'area', b.area,
+             'id', b.id, 'code', b.code, 'name', b.name, 'area', b.area, 'kind', b.kind,
+             'cover', coalesce(b.photos[1], ''), 'has_video', b.cover_video <> '',
              'owner_email', coalesce(nullif(o.email, ''), b.owner_email), 'owner_phone', coalesce(nullif(o.phone, ''), b.owner_phone),
              'owner_name', o.name, 'owner_joined', b.owner_id is not null,
              'flats', (select count(*) from public.inventory i where i.building_id = b.id))
@@ -349,17 +353,27 @@ begin
     latitude     = case when b.latitude is null and p ? 'latitude' then nullif(p ->> 'latitude', '')::numeric else b.latitude end,
     longitude    = case when b.longitude is null and p ? 'longitude' then nullif(p ->> 'longitude', '')::numeric else b.longitude end,
     total_floors = case when p ? 'total_floors' and coalesce(p ->> 'total_floors', '') <> '' then (p ->> 'total_floors')::int else b.total_floors end,
+    kind         = case when p ->> 'kind' in ('building', 'society') then p ->> 'kind' else b.kind end,
     owner_email  = case when p ? 'owner_email' then lower(trim(coalesce(p ->> 'owner_email', ''))) else b.owner_email end,
     owner_phone  = case when p ? 'owner_phone' then trim(coalesce(p ->> 'owner_phone', '')) else b.owner_phone end,
+    description  = case when p ? 'description' then left(coalesce(p ->> 'description', ''), 2000) else b.description end,
+    amenities    = case when p ? 'amenities' then array(select left(x, 60) from jsonb_array_elements_text(p -> 'amenities') x limit 40) else b.amenities end,
+    photos       = case when p ? 'photos' then array(select x from jsonb_array_elements_text(p -> 'photos') x where x ~ '^https://' limit 30) else b.photos end,
+    cover_video  = case when p ? 'cover_video' and coalesce(p ->> 'cover_video', '') ~ '^(https://.*)?$' then coalesce(p ->> 'cover_video', '') else b.cover_video end,
+    status       = case when p ->> 'status' in ('active', 'paused') then p ->> 'status' else b.status end,
     updated_at   = now()
   where b.id = bid;
+  -- A society has no single owner: each flat goes to its own (inventory_private).
+  update public.owner_buildings set owner_id = null, owner_email = '', owner_phone = ''
+   where id = bid and kind = 'society' and (owner_id is not null or owner_email <> '' or owner_phone <> '');
 
   return (select jsonb_build_object('id', b.id, 'code', b.code) from public.owner_buildings b where b.id = bid);
 end;
 $$;
 
-/** Put a flat in a building (or take it out) from the CRM, on a floor. */
-create or replace function public.crm_set_flat_building(p_property text, p_building uuid, p_floor int default null)
+/** Put a flat in a building (or take it out) from the CRM, on a floor, with its house number. */
+drop function if exists public.crm_set_flat_building(text, uuid, int);
+create or replace function public.crm_set_flat_building(p_property text, p_building uuid, p_floor int default null, p_unit_no text default null)
 returns void
 language plpgsql
 security definer
@@ -372,9 +386,84 @@ begin
   if p_building is not null and not exists (select 1 from public.owner_buildings where id = p_building) then
     raise exception 'No such building.' using errcode = '22023';
   end if;
-  update public.inventory set building_id = p_building, floor_number = coalesce(p_floor, floor_number), updated_at = now()
-   where property_id = p_property;
+  update public.inventory set
+    building_id  = p_building,
+    floor_number = coalesce(p_floor, floor_number),
+    unit_no      = case when p_unit_no is not null then left(trim(p_unit_no), 20) when p_building is null then '' else unit_no end,
+    unit_order   = case when p_building is null then null else unit_order end,
+    updated_at   = now()
+   where property_id = upper(trim(p_property));
   if not found then raise exception 'No such listing.' using errcode = '22023'; end if;
+end;
+$$;
+
+/** One building for the CRM's editor: everything about it, and every flat in it (any status) in its order. */
+create or replace function public.crm_building_detail(p_building uuid)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_crm_staff() then raise exception 'CRM staff only.' using errcode = '42501'; end if;
+  return (
+    select jsonb_build_object(
+      'id', b.id, 'code', b.code, 'name', b.name, 'kind', b.kind, 'area', b.area, 'landmark', b.landmark,
+      'full_address', b.full_address, 'latitude', b.latitude, 'longitude', b.longitude, 'total_floors', b.total_floors,
+      'description', b.description, 'amenities', b.amenities, 'photos', b.photos, 'cover_video', b.cover_video,
+      'status', b.status, 'owner_email', b.owner_email, 'owner_phone', b.owner_phone,
+      'owner', (select jsonb_build_object('name', o.name, 'email', o.email, 'phone', o.phone)
+                  from public.owner_accounts o where o.user_id = b.owner_id),
+      'stats', public.building_stats(b.id),
+      'flats', coalesce((
+        select jsonb_agg(jsonb_build_object(
+                 'property_id', i.property_id, 'title', i.title, 'flat_type', i.flat_type, 'furnishing', i.furnishing,
+                 'rent', i.rent, 'status', i.status, 'floor_number', i.floor_number, 'unit_no', i.unit_no,
+                 'unit_order', i.unit_order, 'cover_image_url', i.cover_image_url, 'images', i.images,
+                 'owner', (select coalesce(nullif(o.email, ''), o.name)
+                             from public.owner_property_links l join public.owner_accounts o on o.user_id = l.owner_id
+                            where l.property_id = i.property_id),
+                 'owner_contact', (select coalesce(nullif(ip.owner_email, ''), ip.owner_phone)
+                                     from public.inventory_private ip where ip.property_id = i.property_id))
+               order by i.unit_order nulls last, i.floor_number nulls last, i.rent, i.property_id)
+          from public.inventory i where i.building_id = b.id), '[]'::jsonb))
+    from public.owner_buildings b where b.id = p_building);
+end;
+$$;
+
+/**
+ * Put flats in a building and set each one's house number, floor and place in
+ * the list: p_units is [{ property_id, unit_no?, floor_number?, unit_order? }].
+ * Flats not named are left as they are. Returns how many were updated.
+ */
+create or replace function public.crm_building_set_units(p_building uuid, p_units jsonb)
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  u jsonb;
+  n int := 0;
+begin
+  if not public.has_admin_scope('crm.properties.write') then
+    raise exception 'Needs permission to change properties.' using errcode = '42501';
+  end if;
+  if not exists (select 1 from public.owner_buildings where id = p_building) then
+    raise exception 'No such building.' using errcode = '22023';
+  end if;
+  for u in select * from jsonb_array_elements(coalesce(p_units, '[]'::jsonb)) loop
+    update public.inventory i set
+      building_id  = p_building,
+      unit_no      = case when u ? 'unit_no' then left(trim(coalesce(u ->> 'unit_no', '')), 20) else i.unit_no end,
+      floor_number = case when u ? 'floor_number' then nullif(u ->> 'floor_number', '')::int else i.floor_number end,
+      unit_order   = case when u ? 'unit_order' then nullif(u ->> 'unit_order', '')::int else i.unit_order end,
+      updated_at   = now()
+     where i.property_id = upper(trim(coalesce(u ->> 'property_id', '')));
+    if found then n := n + 1; end if;
+  end loop;
+  return n;
 end;
 $$;
 
@@ -402,6 +491,49 @@ begin
 end;
 $$;
 
+-- ── A partner's QR, from the CRM ─────────────────────────────────────────────
+/**
+ * A partner broker's storefront — the page their QR opens, with only their
+ * flats (partner_storefront.sql) — made on first ask, so MovEazy can print a
+ * broker's poster for them. CRM staff only.
+ */
+create or replace function public.crm_partner_storefront(p_user uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  c text;
+  i int;
+begin
+  if not public.is_crm_staff() then raise exception 'CRM staff only.' using errcode = '42501'; end if;
+  if not exists (select 1 from public.broker_partners where user_id = p_user and status = 'approved') then
+    raise exception 'Only approved partners have a QR.' using errcode = '22023';
+  end if;
+  if not exists (select 1 from public.partner_storefronts where broker_id = p_user) then
+    for i in 1..25 loop
+      select string_agg(substr('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', 1 + floor(random() * 32)::int, 1), '')
+        into c from generate_series(1, 6);
+      begin
+        insert into public.partner_storefronts (broker_id, code) values (p_user, c);
+        exit;
+      exception when unique_violation then
+        if exists (select 1 from public.partner_storefronts where broker_id = p_user) then exit; end if;
+      end;
+    end loop;
+  end if;
+  return (
+    select jsonb_build_object(
+      'code', s.code, 'photo_url', s.photo_url, 'name', bp.name, 'agency', bp.agency, 'phone', bp.phone,
+      'rating', (select round(avg(r.stars)::numeric, 1) from public.partner_storefront_ratings r where r.broker_id = p_user),
+      'ratings', (select count(*) from public.partner_storefront_ratings r where r.broker_id = p_user),
+      'homes', (select count(*) from public.storefront_homes(p_user)))
+      from public.partner_storefronts s join public.broker_partners bp on bp.user_id = s.broker_id
+     where s.broker_id = p_user);
+end;
+$fn$;
+
 -- ── Grants ───────────────────────────────────────────────────────────────────
 do $$
 declare f text;
@@ -416,7 +548,8 @@ begin
   end loop;
   foreach f in array array[
     'public.partner_claim_crm_listings()', 'public.crm_building_options()', 'public.crm_building_save(jsonb)',
-    'public.crm_set_flat_building(text, uuid, int)', 'public.crm_property_links(text)'
+    'public.crm_set_flat_building(text, uuid, int, text)', 'public.crm_property_links(text)',
+    'public.crm_building_detail(uuid)', 'public.crm_building_set_units(uuid, jsonb)', 'public.crm_partner_storefront(uuid)'
   ] loop
     execute format('revoke all on function %s from public, anon', f);
     execute format('grant execute on function %s to authenticated', f);

@@ -174,6 +174,41 @@ check(ids(await as(db, neha, "select property_id from public.owner_properties()"
 const det = await J(db, neha, `select public.owner_building_detail('${bld.id}')`);
 check(det?.flats?.length === 3 && det.stats, "and her dashboard shows the building's flats and funnel");
 
+console.log("\nhouse numbers, order, societies");
+await upload("MZ-L3", {});
+const set = await J(db, writer, `select public.crm_building_set_units('${bld.id}', '[{"property_id":"MZ-L2","unit_no":"301","unit_order":1},
+  {"property_id":"mz-l0","unit_no":"G-01","floor_number":0,"unit_order":2},{"property_id":"MZ-L3","unit_no":"402","floor_number":4}]')`);
+check(set === 3, "staff group three flats with house numbers and an order (adding a new one to the building)", String(set));
+check(denied(await as(db, staff, `select public.crm_building_set_units('${bld.id}', '[]')`)), "ordering needs crm.properties.write");
+const page = await J(db, anon, `select public.building_page('${bld.code}')`);
+check(page?.flats?.map((f) => f.property_id).join() === "MZ-L2,MZ-L0,MZ-L1,MZ-L3" && page.flats[0].unit_no === "301",
+  "the QR page lists them in MovEazy's order, unordered ones after, with house numbers", page?.flats?.map((f) => `${f.property_id}:${f.unit_no}`).join());
+check(!(await as(db, writer, `select public.crm_building_save('{"id":"${bld.id}","cover_video":"https://x.supabase.co/v.mp4","photos":["https://x.supabase.co/a.jpg"]}')`)).error,
+  "staff add the building's cover video and photos");
+const page2 = await J(db, anon, `select public.building_page('${bld.code}')`);
+check(page2?.cover_video === "https://x.supabase.co/v.mp4" && page2.photos?.length === 1 && page2.kind === "building", "the QR page opens with the video");
+await as(db, writer, `select public.crm_building_save('{"id":"${bld.id}","cover_video":"javascript:alert(1)"}')`);
+check((await J(db, anon, `select public.building_page('${bld.code}')`))?.cover_video === "https://x.supabase.co/v.mp4", "a non-https video is ignored");
+const det2 = await J(db, staff, `select public.crm_building_detail('${bld.id}')`);
+check(det2?.flats?.length === 4 && det2.flats[0].unit_no === "301" && det2.owner?.email === "newowner@example.com",
+  "the CRM editor sees every flat, in order, and the owner", JSON.stringify(det2?.flats?.map((f) => f.unit_no)));
+check(ids(await as(db, neha, "select property_id from public.owner_properties()")) === "MZ-L0,MZ-L1,MZ-L2,MZ-L3",
+  "a flat grouped into her building is hers too");
+await as(db, writer, "select public.crm_set_flat_building('MZ-L3', null)");
+check((await db.query("select unit_no from public.inventory where property_id = 'MZ-L3'")).rows[0].unit_no === "",
+  "taking a flat out of the building clears its house number");
+
+const soc = await J(db, writer, `select public.crm_building_save('{"name":"Green Glen Society","kind":"society","owner_email":"someone@example.com"}')`);
+const socRow = (await db.query(`select kind, owner_email from public.owner_buildings where id = '${soc.id}'`)).rows[0];
+check(socRow?.kind === "society" && socRow.owner_email === "", "a society keeps no single owner contact", JSON.stringify(socRow));
+await upload("MZ-S1", { email: "priya@example.com", multi: true });
+await upload("MZ-S2", { email: "om@example.com", multi: true });
+await as(db, writer, `select public.crm_building_set_units('${soc.id}', '[{"property_id":"MZ-S1","unit_no":"A-101"},{"property_id":"MZ-S2","unit_no":"B-202"}]')`);
+const pr = ids(await as(db, o1, "select property_id from public.owner_properties()"));
+check(pr.includes("MZ-S1") && !pr.includes("MZ-S2"), "in a society each owner gets only their own flat", pr);
+check(ids(await as(db, o2, "select property_id from public.owner_properties()")).includes("MZ-S2"), "and the other owner theirs");
+check((await J(db, o1, "select public.owner_buildings_list()"))?.every((b) => b.id !== soc.id), "nobody owns the society itself");
+
 console.log("\npartner brokers");
 await as(db, broker, "select public.partner_register('Bala', 'Bala Homes')");
 await upload("MZ-B1", { source: "broker", broker: "e1111111-0000-0000-0000-000000000001" });
@@ -191,6 +226,12 @@ await upload("MZ-B2", { source: "broker", broker: "e1111111-0000-0000-0000-00000
 check(Number((await db.query("select count(*) n from public.partner_listings where property_id = 'MZ-B2' and broker_id = '" + B + "'")).rows[0].n) === 1,
   "a flat added for him while on a plan is his at once");
 check(Number(await J(db, broker, "select public.partner_claim_crm_listings()")) === 0, "claiming again changes nothing");
+
+const sf = await J(db, staff, `select public.crm_partner_storefront('${B}')`);
+check(/^[A-HJ-NP-Z2-9]{6}$/.test(sf?.code || "") && sf.name === "Bala", "the CRM gets Bala's storefront QR code (made on first ask)", JSON.stringify(sf));
+check((await J(db, staff, `select public.crm_partner_storefront('${B}')`))?.code === sf?.code, "the same code every time");
+check(denied(await as(db, broker, `select public.crm_partner_storefront('${B}')`)), "only staff ask for it");
+check(!!(await as(db, staff, `select public.crm_partner_storefront('${O1}')`)).error, "an owner is not a partner");
 
 console.log("\nthe CRM sees who has it");
 const links = await J(db, staff, "select public.crm_property_links('mz-l0')");
