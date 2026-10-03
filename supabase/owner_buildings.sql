@@ -24,6 +24,13 @@
 --                            how it went.
 --   owner_building_bookings  a flat booked — from a lead, or marked by the owner.
 --
+-- Instant visit: the owner can let tenants who scan walk in right away. They
+-- name a POC (a caretaker, a family member) and their mobile; the QR page then
+-- offers "Instant visit". A signed-in tenant who takes it gets the POC's name
+-- and number and the address — nobody else ever sees them — and the visit
+-- lands as a lead of kind 'instant', in the tenant's visits, the CRM's clients
+-- and Visits, the partner's and the owner's notifications, and the QR's counts.
+--
 -- Nobody reads these tables directly; everything goes through the functions
 -- below, each of which says who may call it.
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +74,12 @@ end $$;
 -- The video the QR page opens with (a walk-through of the building).
 alter table public.owner_buildings add column if not exists cover_video text not null default '';
 create index if not exists owner_buildings_broker_idx on public.owner_buildings (broker_id);
+-- Instant visit: on or off, and who shows the flats (never on the public page).
+alter table public.owner_buildings add column if not exists instant_visit boolean not null default false;
+alter table public.owner_buildings add column if not exists instant_poc_name text not null default '';
+alter table public.owner_buildings add column if not exists instant_poc_phone text not null default '';
+alter table public.owner_buildings add column if not exists instant_updated_at timestamptz;
+alter table public.owner_buildings add column if not exists instant_updated_by text not null default '';
 
 alter table public.inventory add column if not exists building_id uuid references public.owner_buildings (id) on delete set null;
 alter table public.inventory add column if not exists floor_number int;
@@ -108,6 +121,21 @@ create index if not exists owner_building_leads_broker_idx on public.owner_build
 -- The account that asked (Google sign-in): the visit is theirs, and they are a client in the CRM.
 alter table public.owner_building_leads add column if not exists user_id uuid references auth.users (id) on delete set null;
 create index if not exists owner_building_leads_user_idx on public.owner_building_leads (user_id);
+-- 'scheduled': a time asked for, the partner confirms it. 'instant': on the way now.
+alter table public.owner_building_leads add column if not exists kind text not null default 'scheduled';
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'owner_building_leads_kind_check') then
+    alter table public.owner_building_leads add constraint owner_building_leads_kind_check check (kind in ('scheduled', 'instant'));
+  end if;
+end $$;
+
+-- A tenant's own visit to a flat can be an instant one (visits_schema.sql).
+do $$ begin
+  if to_regclass('public.visit_bookings') is not null then
+    alter table public.visit_bookings drop constraint if exists visit_bookings_kind_check;
+    alter table public.visit_bookings add constraint visit_bookings_kind_check check (kind in ('individual', 'combined', 'instant'));
+  end if;
+end $$;
 
 create table if not exists public.owner_building_bookings (
   property_id text primary key references public.inventory (property_id) on delete cascade,
@@ -187,7 +215,9 @@ as $$
                    where l.building_id = p_building and l.status in ('visited', 'booked')),
     'booked',    (select count(*) from public.owner_building_bookings k where k.building_id = p_building),
     'upcoming',  (select count(*) from public.owner_building_leads l
-                   where l.building_id = p_building and l.status in ('new', 'confirmed') and l.visit_at > now())
+                   where l.building_id = p_building and l.status in ('new', 'confirmed') and l.visit_at > now()),
+    'instant',   (select count(*) from public.owner_building_leads l
+                   where l.building_id = p_building and l.kind = 'instant' and l.status <> 'cancelled')
   );
 $$;
 
@@ -228,7 +258,9 @@ as $$
     'total_floors', b.total_floors, 'description', b.description, 'amenities', b.amenities, 'photos', b.photos,
     'kind', b.kind, 'cover_video', b.cover_video,
     'flats', public.building_flats(b.id),
-    'has_partner', b.broker_id is not null
+    'has_partner', b.broker_id is not null,
+    -- Only whether it's on: the POC is for a signed-in tenant who takes it.
+    'instant_visit', b.instant_visit and b.instant_poc_phone <> ''
   )
   from public.owner_buildings b
   where b.id = public.building_by_code(p_code);
@@ -368,6 +400,139 @@ begin
 end;
 $$;
 
+/**
+ * Instant visit: a signed-in tenant is heading to the property now. Their
+ * name and mobile, the flats they want to see (none picked: every free flat),
+ * and back come the POC's name and number and the address — what they need to
+ * walk in. The visit is theirs (visit_bookings, kind 'instant'), they are a
+ * client in the CRM, the partner and MovEazy are told at once, and the owner
+ * sees it in their notifications.
+ */
+create or replace function public.building_instant_visit(
+  p_code text, p_visitor text, p_name text, p_phone text, p_properties text[] default '{}'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid   uuid := auth.uid();
+  b     public.owner_buildings%rowtype;
+  ph    text := right(regexp_replace(coalesce(p_phone, ''), '\D', '', 'g'), 10);
+  nm    text := left(trim(coalesce(p_name, '')), 80);
+  flats text[];
+  lid   uuid;
+  fresh boolean := false;
+  -- Expected at the gate in about half an hour.
+  arrive timestamptz := date_trunc('minute', now()) + interval '30 minutes';
+  cid   uuid;
+begin
+  if uid is null then raise exception 'Sign in with Google to start your instant visit.' using errcode = '42501'; end if;
+  select * into b from public.owner_buildings where id = public.building_by_code(p_code);
+  if b.id is null then raise exception 'This property is not taking visits right now.' using errcode = '22023'; end if;
+  if not b.instant_visit or b.instant_poc_phone = '' then
+    raise exception 'Instant visits are off here right now — schedule a visit instead.' using errcode = '22023';
+  end if;
+  if ph !~ '^[6-9][0-9]{9}$' then raise exception 'Enter a 10-digit mobile number.' using errcode = '22023'; end if;
+  if length(nm) < 2 then raise exception 'Tell us your name.' using errcode = '22023'; end if;
+  if (select count(*) from public.owner_building_leads
+       where user_id = uid and created_at > now() - interval '1 hour') >= 20 then
+    raise exception 'Too many requests. Try again in a while.' using errcode = '54000';
+  end if;
+
+  -- The free flats they picked; none picked, every free flat.
+  select coalesce(array_agg(distinct i.property_id), '{}') into flats
+    from public.inventory i
+   where i.building_id = b.id and i.status in ('published', 'paused')
+     and not exists (select 1 from public.owner_building_bookings k where k.property_id = i.property_id)
+     and (cardinality(coalesce(p_properties, '{}')) = 0 or i.property_id = any(p_properties));
+  if cardinality(flats) = 0 and cardinality(coalesce(p_properties, '{}')) > 0 then
+    select coalesce(array_agg(distinct i.property_id), '{}') into flats
+      from public.inventory i
+     where i.building_id = b.id and i.status in ('published', 'paused')
+       and not exists (select 1 from public.owner_building_bookings k where k.property_id = i.property_id);
+  end if;
+
+  -- An open request from them becomes this instant visit.
+  select id into lid from public.owner_building_leads
+   where building_id = b.id and (user_id = uid or phone = ph) and status in ('new', 'confirmed')
+   order by created_at desc limit 1;
+  if lid is null then
+    insert into public.owner_building_leads (building_id, name, phone, property_ids, visit_at, status, kind, broker_id, visitor, user_id, updated_by)
+    values (b.id, nm, ph, flats, arrive, 'confirmed', 'instant', b.broker_id, left(coalesce(p_visitor, ''), 64), uid, 'renter')
+    returning id into lid;
+    fresh := true;
+  else
+    update public.owner_building_leads set
+      name = nm, phone = ph, user_id = uid, kind = 'instant', visit_at = arrive, status = 'confirmed',
+      property_ids = (select coalesce(array_agg(distinct x), '{}') from unnest(property_ids || flats) x),
+      updated_at = now(), updated_by = 'renter'
+    where id = lid;
+  end if;
+  -- Every flat in the visit is seen now, including any from the request it replaced.
+  select l.property_ids into flats from public.owner_building_leads l where l.id = lid;
+
+  if b.broker_id is not null and to_regclass('public.partner_tenants') is not null then
+    insert into public.partner_tenants (broker_id, phone, name, source)
+    values (b.broker_id, ph, nm, 'building')
+    on conflict (broker_id, phone) do update set last_seen_at = now(),
+      name = case when partner_tenants.name = '' then excluded.name else partner_tenants.name end;
+  end if;
+  if b.broker_id is not null and to_regclass('public.partner_notifications') is not null then
+    insert into public.partner_notifications (broker_id, kind, title, body, link)
+    values (b.broker_id, 'building_visit', 'Instant visit: ' || nm || ' is heading to ' || b.name,
+            ph || ' · there by ' || to_char(arrive at time zone 'Asia/Kolkata', 'HH12:MI AM') || ' · ' || b.instant_poc_name || ' shows the flats',
+            '/building-leads');
+  end if;
+
+  update public.user_profiles set phone = ph, name = case when coalesce(name, '') = '' then nm else name end
+   where id = uid and coalesce(trim(phone), '') = '';
+
+  if to_regclass('public.crm_clients') is not null then
+    execute 'update public.crm_clients c set user_id = $1
+              where c.user_id is null
+                and not exists (select 1 from public.crm_clients x where x.user_id = $1)
+                and c.id = (select y.id from public.crm_clients y
+                             where y.user_id is null and right(regexp_replace(coalesce(y.phone, ''''), ''\D'', '''', ''g''), 10) = $2
+                             limit 1)'
+      using uid, ph;
+    execute 'insert into public.crm_clients (user_id, name, phone, source)
+             select $1, $2, $3, ''instant_visit''
+              where not exists (select 1 from public.crm_clients x where x.user_id = $1)'
+      using uid, nm, ph;
+    execute 'select id from public.crm_clients where user_id = $1' into cid using uid;
+  end if;
+
+  if cardinality(flats) > 0 and to_regclass('public.visit_bookings') is not null then
+    insert into public.visit_bookings (user_id, property_id, slot_at, kind, status)
+    select uid, f, arrive, 'instant', 'scheduled' from unnest(flats) f
+    on conflict (user_id, property_id) do update set slot_at = excluded.slot_at, status = excluded.status, kind = excluded.kind;
+  end if;
+
+  -- MovEazy's team hears at once: someone is at the gate within the half hour.
+  if to_regclass('public.crm_notifications') is not null then
+    execute format('insert into public.crm_notifications (for_email, type, title, body%s) values ($1, ''visit'', $2, $3%s)',
+                   case when cid is not null and exists (select 1 from information_schema.columns
+                          where table_schema = 'public' and table_name = 'crm_notifications' and column_name = 'client_id')
+                        then ', client_id' else '' end,
+                   case when cid is not null and exists (select 1 from information_schema.columns
+                          where table_schema = 'public' and table_name = 'crm_notifications' and column_name = 'client_id')
+                        then ', $4' else '' end)
+      using 'yatharth200018@gmail.com', 'Instant visit · ' || b.name,
+            nm || ' (' || ph || ') is heading there now — ' || b.instant_poc_name || ' (' || b.instant_poc_phone || ') shows the flats.',
+            cid;
+  end if;
+
+  return jsonb_build_object(
+    'id', lid, 'updated', not fresh, 'arrive_by', arrive, 'flats', cardinality(flats),
+    'poc_name', b.instant_poc_name, 'poc_phone', b.instant_poc_phone,
+    'name', b.name, 'area', b.area, 'landmark', b.landmark, 'address', b.full_address,
+    'latitude', b.latitude, 'longitude', b.longitude
+  );
+end;
+$$;
+
 -- ── The owner's side ─────────────────────────────────────────────────────────
 
 /** The caller's buildings, each with its funnel and flat counts. */
@@ -383,7 +548,7 @@ as $$
            'full_address', b.full_address, 'latitude', b.latitude, 'longitude', b.longitude,
            'total_floors', b.total_floors, 'description', b.description, 'amenities', b.amenities,
            'photos', b.photos, 'status', b.status, 'created_at', b.created_at, 'kind', b.kind, 'cover_video', b.cover_video,
-           'has_partner', b.broker_id is not null,
+           'has_partner', b.broker_id is not null, 'instant_visit', b.instant_visit,
            'flats', (select count(*) from public.inventory i where i.building_id = b.id),
            'stats', public.building_stats(b.id))
          order by b.created_at desc), '[]'::jsonb)
@@ -462,6 +627,47 @@ begin
 end;
 $$;
 
+/**
+ * Turn instant visit on (with the POC who shows the flats) or off. The
+ * building's owner, or MovEazy staff for a building whose owner isn't in the
+ * app yet. Off keeps the POC, so turning it back on is one tap.
+ */
+create or replace function public.building_set_instant_visit(p_building uuid, p_on boolean, p_name text default '', p_phone text default '')
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  who text;
+  ph  text := right(regexp_replace(coalesce(p_phone, ''), '\D', '', 'g'), 10);
+  nm  text := left(trim(coalesce(p_name, '')), 80);
+begin
+  who := case
+    when auth.uid() is null then null
+    when public.is_crm_staff() then 'staff'
+    when public.is_approved_owner()
+         and exists (select 1 from public.owner_buildings b where b.id = p_building and b.owner_id = auth.uid()) then 'owner'
+  end;
+  if who is null then raise exception 'Only the owner can set up instant visits.' using errcode = '42501'; end if;
+  if coalesce(p_on, false) then
+    if length(nm) < 2 then raise exception 'Add the name of the person who shows the flats.' using errcode = '22023'; end if;
+    if ph !~ '^[6-9][0-9]{9}$' then raise exception 'Add their 10-digit mobile number.' using errcode = '22023'; end if;
+  end if;
+  update public.owner_buildings b set
+    instant_visit      = coalesce(p_on, false),
+    instant_poc_name   = case when coalesce(p_on, false) then nm else b.instant_poc_name end,
+    instant_poc_phone  = case when coalesce(p_on, false) then ph else b.instant_poc_phone end,
+    instant_updated_at = now(),
+    instant_updated_by = who,
+    updated_at         = now()
+  where b.id = p_building;
+  if not found then raise exception 'No such property.' using errcode = '22023'; end if;
+  return (select jsonb_build_object('instant_visit', b.instant_visit, 'poc_name', b.instant_poc_name, 'poc_phone', b.instant_poc_phone)
+            from public.owner_buildings b where b.id = p_building);
+end;
+$$;
+
 /** One building, in full, for its owner: the funnel, the flats, and every visit (first name and initial only). */
 create or replace function public.owner_building_detail(p_building uuid)
 returns jsonb
@@ -475,13 +681,15 @@ as $$
     'latitude', b.latitude, 'longitude', b.longitude, 'total_floors', b.total_floors, 'description', b.description,
     'amenities', b.amenities, 'photos', b.photos, 'status', b.status, 'has_partner', b.broker_id is not null,
     'kind', b.kind, 'cover_video', b.cover_video,
+    'instant_visit', b.instant_visit, 'instant_poc_name', b.instant_poc_name, 'instant_poc_phone', b.instant_poc_phone,
     'stats', public.building_stats(b.id),
     'flats', public.building_flats(b.id),
     'booked', coalesce((select jsonb_agg(k.property_id) from public.owner_building_bookings k where k.building_id = b.id), '[]'::jsonb),
     'leads', coalesce((
       select jsonb_agg(jsonb_build_object(
                'id', l.id, 'name', public.owner_display_name(l.name), 'property_ids', l.property_ids,
-               'visit_at', l.visit_at, 'status', l.status, 'booked_property', l.booked_property, 'created_at', l.created_at)
+               'visit_at', l.visit_at, 'status', l.status, 'booked_property', l.booked_property, 'created_at', l.created_at,
+               'kind', l.kind)
              order by coalesce(l.visit_at, l.created_at) desc)
         from public.owner_building_leads l where l.building_id = b.id), '[]'::jsonb),
     'by_day', (
@@ -591,13 +799,14 @@ as $$
     'buildings', coalesce((
       select jsonb_agg(jsonb_build_object('id', b.id, 'code', b.code, 'name', b.name, 'area', b.area, 'landmark', b.landmark,
                                           'full_address', b.full_address, 'flats', public.building_flats(b.id),
-                                          'stats', public.building_stats(b.id)) order by b.name)
+                                          'stats', public.building_stats(b.id), 'instant_visit', b.instant_visit,
+                                          'instant_poc_name', b.instant_poc_name, 'instant_poc_phone', b.instant_poc_phone) order by b.name)
         from public.owner_buildings b where b.broker_id = auth.uid()), '[]'::jsonb),
     'leads', coalesce((
       select jsonb_agg(jsonb_build_object(
                'id', l.id, 'building_id', l.building_id, 'name', l.name, 'phone', l.phone, 'property_ids', l.property_ids,
                'visit_at', l.visit_at, 'note', l.note, 'status', l.status, 'booked_property', l.booked_property,
-               'created_at', l.created_at, 'updated_at', l.updated_at)
+               'created_at', l.created_at, 'updated_at', l.updated_at, 'kind', l.kind)
              order by l.created_at desc)
         from public.owner_building_leads l join public.owner_buildings b on b.id = l.building_id
        where b.broker_id = auth.uid()), '[]'::jsonb)
@@ -631,14 +840,17 @@ begin
                'broker', (select jsonb_build_object('name', p.name, 'phone', p.phone, 'agency', p.agency)
                             from public.broker_partners p where p.user_id = b.broker_id),
                'flats', public.building_flats(b.id),
-               'stats', public.building_stats(b.id))
+               'stats', public.building_stats(b.id),
+               'instant_visit', b.instant_visit, 'instant_poc_name', b.instant_poc_name,
+               'instant_poc_phone', b.instant_poc_phone, 'instant_updated_at', b.instant_updated_at,
+               'instant_updated_by', b.instant_updated_by)
              order by b.created_at desc)
         from public.owner_buildings b), '[]'::jsonb),
     'leads', coalesce((
       select jsonb_agg(jsonb_build_object(
                'id', l.id, 'building_id', l.building_id, 'name', l.name, 'phone', l.phone, 'property_ids', l.property_ids,
                'visit_at', l.visit_at, 'note', l.note, 'status', l.status, 'booked_property', l.booked_property,
-               'updated_by', l.updated_by, 'created_at', l.created_at)
+               'updated_by', l.updated_by, 'created_at', l.created_at, 'kind', l.kind)
              order by l.created_at desc)
         from public.owner_building_leads l), '[]'::jsonb),
     'partners', coalesce((
@@ -754,6 +966,66 @@ as $$
   order by l.linked_at desc;
 $$;
 
+-- ── The owner's notifications, with their buildings' visits ─────────────────
+-- owner_schema.sql's owner_activity, plus a visit (scheduled or instant) asked
+-- for through one of the owner's building QRs — once, not again per flat it
+-- also put in the tenant's visits. Re-running owner_schema.sql puts the old
+-- one back; re-run this file after it.
+drop function if exists public.owner_activity(int);
+create function public.owner_activity(p_days int default 30)
+returns table (kind text, property_id text, request_id uuid, who text, slot_at timestamptz, message text, at timestamptz, building_id uuid)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with mine as (
+    select l.property_id from public.owner_property_links l
+     where l.owner_id = auth.uid() and public.is_approved_owner()
+  ), my_buildings as (
+    select b.id, b.name from public.owner_buildings b
+     where b.owner_id = auth.uid() and public.is_approved_owner()
+  )
+  select * from (
+    select case when b.status = 'preference' or b.slot_at is null then 'visit_requested' else 'visit_booked' end,
+           b.property_id, null::uuid,
+           public.owner_display_name((select up.name from public.user_profiles up where up.id = b.user_id)),
+           b.slot_at, ''::text, b.created_at, null::uuid
+      from public.visit_bookings b
+     where b.property_id in (select property_id from mine)
+       and coalesce(b.status, '') not ilike 'cancel%'
+       and b.created_at > now() - make_interval(days => p_days)
+       and not exists (select 1 from public.owner_building_leads l
+                        where l.user_id = b.user_id and b.property_id = any(l.property_ids)
+                          and l.building_id in (select id from my_buildings))
+    union all
+    select case when l.kind = 'instant' then 'instant_visit' else 'building_visit' end,
+           l.property_ids[1], null::uuid, public.owner_display_name(l.name), l.visit_at, mb.name,
+           case when l.updated_by = 'renter' then l.updated_at else l.created_at end, l.building_id
+      from public.owner_building_leads l
+      join my_buildings mb on mb.id = l.building_id
+     where l.status <> 'cancelled'
+       and l.created_at > now() - make_interval(days => p_days)
+    union all
+    select 'liked', r.property_id, null::uuid,
+           public.owner_display_name((select up.name from public.user_profiles up where up.id = r.user_id)),
+           null::timestamptz, ''::text, r.updated_at, null::uuid
+      from public.listing_reactions r
+     where r.property_id in (select property_id from mine)
+       and r.reaction = 'like'
+       and r.updated_at > now() - make_interval(days => p_days)
+    union all
+    select 'request_update', q.property_id, q.id, ''::text, null::timestamptz, q.title || ': ' || e.message, e.at, null::uuid
+      from public.owner_request_events e
+      join public.owner_requests q on q.id = e.request_id
+     where q.owner_id = auth.uid()
+       and e.visible_to_owner and e.actor <> 'owner'
+       and e.at > now() - make_interval(days => p_days)
+  ) ev
+  order by 7 desc
+  limit 60;
+$$;
+
 -- ── Grants ───────────────────────────────────────────────────────────────────
 do $$
 declare f text;
@@ -765,7 +1037,8 @@ begin
   end loop;
   foreach f in array array[
     'public.building_page(text)', 'public.building_view(text, text, text)',
-    'public.building_request_visit(text, text, text, text, text[], timestamptz, text)'
+    'public.building_request_visit(text, text, text, text, text[], timestamptz, text)',
+    'public.building_instant_visit(text, text, text, text, text[])'
   ] loop
     execute format('revoke all on function %s from public', f);
     execute format('grant execute on function %s to anon, authenticated', f);
@@ -774,7 +1047,8 @@ begin
     'public.owner_properties()', 'public.owner_buildings_list()', 'public.owner_building_save(jsonb)', 'public.owner_building_set_flat(text, uuid, int)',
     'public.owner_building_detail(uuid)', 'public.owner_building_mark_booked(text, boolean)',
     'public.building_lead_update(uuid, jsonb)', 'public.partner_building_leads()',
-    'public.crm_buildings()', 'public.crm_building_assign_broker(uuid, uuid)'
+    'public.crm_buildings()', 'public.crm_building_assign_broker(uuid, uuid)',
+    'public.building_set_instant_visit(uuid, boolean, text, text)', 'public.owner_activity(int)'
   ] loop
     execute format('revoke all on function %s from public, anon', f);
     execute format('grant execute on function %s to authenticated', f);
