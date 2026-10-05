@@ -358,6 +358,8 @@ $$;
 
 
 -- ── The one read: what this caller may see ───────────────────────────────────
+-- Replaced, with the contacts function below, by partner_location.sql (another
+-- broker's exact address only on request) -- re-run that file after this one.
 drop function if exists public.partner_inventory();
 create function public.partner_inventory()
 returns table (
