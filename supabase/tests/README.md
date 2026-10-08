@@ -1,4 +1,4 @@
-# Applying `marketing_schema.sql` before a human does
+# Applying the migrations before a human does
 
 ```bash
 cd supabase/tests
@@ -6,9 +6,9 @@ npm install
 npm test
 ```
 
-Runs the migration against a real Postgres (PGlite, in-process — no server, no
-Docker, no Supabase project), so the SQL editor is not where we discover it does
-not apply.
+Runs `marketing_schema.sql`, `ops_dashboard.sql` and `crm_curated_shares.sql`
+against a real Postgres (PGlite, in-process — no server, no Docker, no
+Supabase project), so the SQL editor is not where we discover they do not apply.
 
 ## Why this exists
 
@@ -33,7 +33,7 @@ back — quietly undoing an access rule and a column that had nothing to do with
 it. The symptom reached us as "this person still cannot open /marketing/rishav",
 four steps from the cause. Hence `upgrade.mjs`.
 
-## The three files
+## The files
 
 **`check.mjs`** — five named shapes, each asserting which funnel steps should
 fill in: `bare` (only `user_profiles`, production's actual state), `full` (repo
@@ -63,6 +63,49 @@ This found a real bug on its second seed: `_mkt_closed_reason` was gated on
 `cc.closed_at`. A `crm_clients` with a reason column and no status compiled a
 function referencing a column that was not there. No hand-written scenario had
 that combination.
+
+**`ops_check.mjs`** — the same idea for `ops_dashboard.sql`, which composes its
+six metrics with dynamic SQL depending on which of `crm_clients`, `inventory`
+and `visit_bookings` exist. Two shapes (`bare`, `full`), plus the arithmetic:
+seeded rows at noon IST on named days, asserted against the day each one should
+land on. It also checks the parts that fail silently — that `anon` can execute
+none of the dashboard functions and holds no select on `dashboard_access`, that
+an ungranted email gets an empty set rather than zeroes, and that the range is
+clamped.
+
+It earned its keep on the first run: Supabase's default privileges had handed
+`anon` a SELECT on `dashboard_access`, which RLS would have refused but which
+was one policy edit away from publishing the roster.
+
+**`curated_check.mjs`** — `crm_curated_shares.sql`, whose three functions are
+the only things a signed-out recipient of a WhatsApp link can call. So the
+checks are the hostile cases: a token that does not exist, a property that is
+not in the batch, an invented reaction, and a swipe arriving after the visit was
+already booked — which must not downgrade `visit_scheduled` back to `liked`.
+It also pins the order `my_curated_properties()` returns, because that array is
+dealt out as a deck and the agent chose the sequence.
+
+**`inventory_check.mjs`** — `inventory_private_read.sql` and
+`inventory_authenticated_columns.sql`, applied over the inventory files in
+production's order. It first reproduces the leak (a signed-in tenant reading
+another poster's phone), then checks every role after the fix: tenant and anon
+refused `select=*`, `select=phone,poster_email` and a `poster_id` filter;
+`authenticated` holding exactly anon's column list; an owner and staff getting
+full rows from `inventory_full()`; owners still able to publish, edit and add
+visit slots; and `recommend_inventory` returning no PII. It also pins the two
+guards in the revoke file — it will not run before the function exists, or
+over a policy that still reads `inventory.poster_id` as the caller, which
+would stop owners adding visit slots.
+
+**`partner_check.mjs`** — `partner_schema.sql`, the broker app. The visibility
+rules are the product, so the checks are the leaks: a partner outside a group
+reading its group-only listing (through `partner_inventory()`, through the
+contacts function, and straight off every table underneath), a removed member
+still seeing it, a locked MovEazy listing carrying an address or a phone, an
+invite link used twice or after expiry, a partner sharing into a group they are
+not in, and a pending or suspended partner seeing anything at all. It also
+pins auto-approve (on by default, and a decision survives re-registering) and
+that manual Premium unlocks and relocks.
 
 ## What it does not cover
 
