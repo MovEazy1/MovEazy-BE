@@ -4,7 +4,9 @@
 -- deal-breakers hard-excluded. Mirrors fe/src/lib/inventoryMatch.js so the client
 -- fallback and this server path agree.
 --
--- Run once in the Supabase SQL editor (after inventory_schema.sql).
+-- Run once in the Supabase SQL editor (after inventory_schema.sql and
+-- inventory_public_columns.sql -- `listing` carries exactly the columns anon is
+-- granted, and before that file anon is granted the whole table). Safe to re-run.
 
 create or replace function public.recommend_inventory(req jsonb, min_score int default 30)
 returns table (property_id text, match_score int, match_reasons text[], listing jsonb)
@@ -27,7 +29,16 @@ with r as (
 comp as (
   select
     inv.property_id, inv.area, inv.flat_type, inv.furnishing, inv.rent,
-    to_jsonb(inv) as listing_json,
+    -- Only what a signed-out visitor may select from the table directly. This
+    -- runs as its owner and is granted to anon, so a plain to_jsonb(inv) handed
+    -- every caller the poster's phone, email and account id -- the column
+    -- grants in inventory_public_columns.sql never applied here. Asking
+    -- has_column_privilege rather than listing columns keeps the two in step:
+    -- a column is in `listing` exactly when anon is granted it.
+    (select coalesce(jsonb_object_agg(e.key, e.value), '{}'::jsonb)
+       from jsonb_each(to_jsonb(inv)) e
+      where has_column_privilege('anon', 'public.inventory'::regclass, e.key, 'select')
+    ) as listing_json,
     r.*,
     coalesce((select array_agg(lower(e)) from unnest(array[inv.area] || coalesce(inv.nearby_areas,'{}')) e), '{}') as l_areas,
     coalesce((select array_agg(lower(e)) from unnest(coalesce(inv.amenities,'{}')) e), '{}')        as l_amen,
