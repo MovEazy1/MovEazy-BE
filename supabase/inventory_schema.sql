@@ -102,6 +102,14 @@ create policy "posters delete own inventory"
 
 -- Raw-SQL tables get no role grants by default; without this every request
 -- fails with insufficient_privilege (42501) before RLS is even evaluated.
+--
+-- SELECT is deliberately not granted table-wide. It once was, to both roles,
+-- and that let anyone -- signed out, then any signed-in tenant -- read every
+-- poster's phone, email and account id. Reads are column grants now:
+--   inventory_public_columns.sql         the public columns, to anon
+--   inventory_authenticated_columns.sql  the same list, to authenticated
+--   inventory_private_read.sql           inventory_full(), the whole row, for
+--                                        its poster and for staff
+-- Re-running this file must not undo them, so it grants no SELECT at all.
 grant usage on schema public to anon, authenticated;
-grant select on public.inventory to anon, authenticated;
 grant insert, update, delete on public.inventory to authenticated;

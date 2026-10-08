@@ -6,8 +6,10 @@
 -- JS bundle) could read every poster's phone, email, name and user ids via
 -- select=*. RLS gates ROWS, not COLUMNS — so this adds column-level grants.
 --
--- anon may read only the listing's public columns. authenticated is left
--- untouched (owners still read their own rows in full via fetchMyInventory).
+-- anon may read only the listing's public columns. authenticated was left
+-- untouched here, which left every signed-in tenant able to read the same PII;
+-- inventory_authenticated_columns.sql gives it this same list, and owners and
+-- staff read full rows through inventory_full() (inventory_private_read.sql).
 -- Run once in the Supabase SQL editor. Safe to re-run.
 
 revoke select on public.inventory from anon;

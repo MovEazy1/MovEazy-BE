@@ -20,6 +20,11 @@
 -- with an account -- which is every tenant, the flow requires Google sign-in --
 -- can read the poster's phone and email of every published flat today.
 --
+-- (Since closed by inventory_private_read.sql + inventory_authenticated_columns.sql:
+-- authenticated now holds the same column list as anon. The reasoning below
+-- still stands -- a column grant is one missed GRANT away from exposure, and
+-- a staff-only table is not.)
+--
 -- A new column on inventory would inherit exactly that. So the internal
 -- details live in their own table, granted to `authenticated` only because
 -- PostgREST needs a grant to consider a request at all, with every row gated
