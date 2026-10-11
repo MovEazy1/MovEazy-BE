@@ -23,6 +23,9 @@
 --            broker was involved. Every 20 leads given need a closure; past
 --            that a request waits for MovEazy's approval (asked on WhatsApp).
 --   The broker says what they want (areas, BHK, budget); MovEazy assigns.
+--   A broker's FIRST request doesn't wait: the best leads available are given
+--   on the spot (lead_auto_assign) — once paid, for the ₹2,000 pack. Requests
+--   already open when this file first ran were filled the same way.
 --
 -- The CRM's Lead requests page (partners.manage) approves payments, picks the
 -- clients (each to at most 3 brokers) and assigns them. The broker then sees
@@ -31,6 +34,10 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 
 begin;
+
+-- Whether auto-assigning is new here: if so, the requests already open get filled once, at the end.
+create temp table _leads_auto_first on commit drop as
+  select to_regprocedure('public.lead_auto_assign(uuid, text)') is null as first;
 
 -- ── Settings the CRM edits ───────────────────────────────────────────────────
 alter table public.program_settings add column if not exists lead_upi_id text not null default '8090911024@pthdfc';
@@ -331,6 +338,7 @@ declare
   cnt    int;
   amt    int := 0;
   v_row  public.partner_lead_requests;
+  given  int := 0;
 begin
   if not public.is_approved_partner() then
     raise exception 'Only MovEazy partners can ask for leads.' using errcode = '42501';
@@ -393,8 +401,14 @@ begin
   insert into public.partner_lead_requests (broker_id, pack, lead_count, amount, utr, prefs, status)
   values (me, p_pack, cnt, amt, v_utr, prefs, v_status)
   returning * into v_row;
+  -- A partner's first request doesn't wait for anyone: the best leads, now.
+  -- (A ₹2,000 pack paid by UTR still waits for the payment to be checked.)
+  if v_row.status = 'open' and public.lead_is_first_request(v_row.id) then
+    given := public.lead_auto_assign(v_row.id, 'auto · first request');
+    select * into v_row from public.partner_lead_requests where id = v_row.id;
+  end if;
   return jsonb_build_object('id', v_row.id, 'status', v_row.status, 'pack', v_row.pack, 'lead_count', v_row.lead_count,
-                            'amount', v_row.amount);
+                            'amount', v_row.amount, 'assigned', given);
 end;
 $$;
 
@@ -425,6 +439,7 @@ begin
    where id = q.id;
   insert into public.partner_notifications (broker_id, kind, title, body, link)
   values (q.broker_id, 'lead_request', 'Payment received', 'MovEazy is picking your 30 leads now.', '/leads?tab=moveazy');
+  if public.lead_is_first_request(q.id) then perform public.lead_auto_assign(q.id, 'auto · first request'); end if;
   return 'paid';
 end;
 $$;
@@ -623,6 +638,7 @@ begin
           case when p_approve then 'MovEazy is picking your leads now — they''ll appear under MovEazy leads.'
                else coalesce(nullif(p_note, ''), 'Message MovEazy on WhatsApp to sort it out.') end,
           '/leads?tab=moveazy');
+  if p_approve and public.lead_is_first_request(q.id) then perform public.lead_auto_assign(q.id, 'auto · first request'); end if;
   return st;
 end;
 $$;
@@ -631,7 +647,7 @@ $$;
  * Clients that could go to this request's broker: in the pool, with fewer than
  * 3 brokers, not theirs already — those fitting what they asked for first.
  */
-create or replace function public.crm_lead_candidates(p_request uuid)
+create or replace function public.lead_candidates(p_request uuid)
 returns table (client_id uuid, name text, phone text, localities text[], flat_types text[], budget_min numeric,
                budget_max numeric, move_in_raw text, move_in date, brokers int, fits int, active_at timestamptz)
 language plpgsql
@@ -646,9 +662,6 @@ declare
   bmin numeric;
   bmax numeric;
 begin
-  if not public.has_admin_scope('partners.manage') then
-    raise exception 'Not allowed.' using errcode = '42501';
-  end if;
   select * into q from public.partner_lead_requests where id = p_request;
   if q.id is null then raise exception 'No such request.' using errcode = '22023'; end if;
   areas := array(select lower(jsonb_array_elements_text(coalesce(q.prefs -> 'areas', '[]'))));
@@ -671,9 +684,26 @@ begin
    limit 300;
 end;
 $$;
+revoke all on function public.lead_candidates(uuid) from public, anon, authenticated;
 
-/** Give these clients to the request's broker. → how many were given. */
-create or replace function public.crm_lead_assign(p_request uuid, p_clients uuid[])
+create or replace function public.crm_lead_candidates(p_request uuid)
+returns table (client_id uuid, name text, phone text, localities text[], flat_types text[], budget_min numeric,
+               budget_max numeric, move_in_raw text, move_in date, brokers int, fits int, active_at timestamptz)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  if not public.has_admin_scope('partners.manage') then
+    raise exception 'Not allowed.' using errcode = '42501';
+  end if;
+  return query select * from public.lead_candidates(p_request);
+end;
+$$;
+
+/** Give these clients to the request's broker. → how many were given. Internal. */
+create or replace function public.lead_give(p_request uuid, p_clients uuid[], p_actor text)
 returns int
 language plpgsql
 security definer
@@ -685,11 +715,8 @@ declare
   given int := 0;
   cid   uuid;
   who   text;
-  actor text := coalesce(auth.jwt() ->> 'email', '');
+  actor text := coalesce(p_actor, '');
 begin
-  if not public.has_admin_scope('partners.manage') then
-    raise exception 'Not allowed.' using errcode = '42501';
-  end if;
   select * into q from public.partner_lead_requests where id = p_request for update;
   if q.id is null then raise exception 'No such request.' using errcode = '22023'; end if;
   if q.status <> 'open' then
@@ -722,6 +749,62 @@ begin
   return given;
 end;
 $$;
+revoke all on function public.lead_give(uuid, uuid[], text) from public, anon, authenticated;
+
+/** The CRM picking clients for a request. */
+create or replace function public.crm_lead_assign(p_request uuid, p_clients uuid[])
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.has_admin_scope('partners.manage') then
+    raise exception 'Not allowed.' using errcode = '42501';
+  end if;
+  return public.lead_give(p_request, p_clients, coalesce(auth.jwt() ->> 'email', ''));
+end;
+$$;
+
+/**
+ * Fill an open request with the best clients available: fitting what they
+ * asked for first, then the next best, freshest first — each under 3 brokers.
+ * → how many were given. Internal.
+ */
+create or replace function public.lead_auto_assign(p_request uuid, p_actor text default 'auto')
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  q    public.partner_lead_requests;
+  room int;
+begin
+  select * into q from public.partner_lead_requests where id = p_request;
+  if q.id is null or q.status <> 'open' then return 0; end if;
+  room := q.lead_count - (select count(*) from public.partner_lead_assignments a where a.request_id = q.id);
+  if room <= 0 then return 0; end if;
+  return public.lead_give(q.id, array(select c.client_id from public.lead_candidates(q.id) c limit room), p_actor);
+end;
+$$;
+revoke all on function public.lead_auto_assign(uuid, text) from public, anon, authenticated;
+
+/** A broker's first request (anything before it was only an abandoned online payment). */
+create or replace function public.lead_is_first_request(p_request uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select not exists (
+    select 1 from public.partner_lead_requests o, public.partner_lead_requests q
+     where q.id = p_request and o.broker_id = q.broker_id and o.id <> q.id
+       and o.created_at <= q.created_at and o.status <> 'cancelled'
+  );
+$$;
+revoke all on function public.lead_is_first_request(uuid) from public, anon, authenticated;
 
 /** For a client's CRM record: which brokers have them, and who reached out when. */
 create or replace function public.crm_client_brokers(p_client uuid)
@@ -811,6 +894,19 @@ begin
   return public.crm_lead_settings();
 end;
 $$;
+
+-- Once, when this arrives: every request already open gets its best leads now.
+-- (Only on the first run with auto-assigning; a re-run leaves later requests to the team.)
+do $$
+declare
+  r record;
+begin
+  if (select first from _leads_auto_first) then
+    for r in select q.id from public.partner_lead_requests q where q.status = 'open' order by q.created_at loop
+      perform public.lead_auto_assign(r.id, 'auto · backfill');
+    end loop;
+  end if;
+end $$;
 
 -- Signed-in only; each function checks who is calling.
 revoke all on function public.partner_moveazy_lead_stats() from public, anon;

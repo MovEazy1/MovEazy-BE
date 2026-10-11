@@ -124,73 +124,87 @@ check((await as({ uid: PEND }, "select public.partner_moveazy_lead_stats()")).er
 check((await as({ role: "anon" }, "select public.partner_moveazy_lead_stats()")).error?.code === "42501", "anon can't");
 check((await as(asha, "select * from public.partner_lead_requests")).rows?.length === 0, "the tables themselves show brokers nothing");
 
-console.log("\nasking");
+console.log("\na first request: the best leads at once");
 const free = one(await as(asha, `select public.partner_lead_request('free10', '{"areas":["HSR Layout"],"flat_types":["1 BHK"],"budget_max":"35000"}')`));
-check(free?.status === "open" && free?.lead_count === 10, "10 free leads: straight to MovEazy to assign", JSON.stringify(free));
-check(/already have a request/.test((await as(asha, "select public.partner_lead_request('paid30', '{}', 'UTR123456')")).error?.message || ""), "one request at a time");
+check(free?.status === "fulfilled" && free?.assigned === 10, "Asha's first ask (10 free): 10 leads given straight away", JSON.stringify(free));
+const ashaFirst = (await db.query(`select c.name, a.assigned_by from public.partner_lead_assignments a join public.crm_clients c on c.id = a.client_id where a.broker_id = '${B1}'`)).rows;
+check(ashaFirst.every((r) => r.name.startsWith("Client ")) && ashaFirst.every((r) => r.assigned_by === "auto · first request"),
+  "the best fits for what she asked (HSR, 1 BHK, ≤ ₹35k), marked as given automatically");
+check((await db.query(`select count(*)::int n from public.partner_notifications where broker_id = '${B1}' and kind = 'leads_assigned'`)).rows[0].n === 1, "she's told");
+check((await db.query(`select count(*)::int n from public.crm_activities where body like 'Shared with partner broker Asha%'`)).rows[0].n === 10, "each client's CRM timeline says so");
+
+console.log("\nasking again, and paying");
 const paid = await as(bala, "select public.partner_lead_request('paid30', '{}', '')");
 check(/UTR/.test(paid.error?.message || ""), "30 leads need the UTR");
 const paidOk = one(await as(bala, "select public.partner_lead_request('paid30', '{}', 'axis 1234 5678')"));
-check(paidOk?.status === "payment_check" && paidOk?.lead_count === 30, "with a UTR: waits for MovEazy to check the payment", JSON.stringify(paidOk));
+check(paidOk?.status === "payment_check" && paidOk?.lead_count === 30 && paidOk?.assigned === 0,
+  "even a first ₹2,000 pack waits for the payment to be checked", JSON.stringify(paidOk));
+check(/already have a request/.test((await as(bala, "select public.partner_lead_request('free10')")).error?.message || ""), "one request at a time");
 check(/already been used/.test((await as(chetan, "select public.partner_lead_request('paid30', '{}', 'AXIS12345678')")).error?.message || ""), "a UTR pays for one pack only");
 check((await as(chetan, "select public.partner_lead_request('premium')")).error?.code === "42501", "unlimited needs Premium");
+const again = one(await as(asha, "select public.partner_lead_request('paid30', '{}', 'UTR123456')"));
+check(again?.status === "payment_check", "Asha's second ask goes through MovEazy");
+
 console.log("\nthe CRM");
 check((await as(agent, "select * from public.crm_lead_requests()")).error?.code === "42501", "an agent without partners.manage can't see requests");
 const reqs = (await as(admin, "select id, pack, status, broker_name from public.crm_lead_requests()")).rows;
-check(reqs?.length === 2, "the admin sees both requests", JSON.stringify(reqs));
-const freeId = free.id, paidId = paidOk.id;
-check(/Approve the request first/.test((await as(admin, `select public.crm_lead_assign('${paidId}', array['c0000000-0000-0000-0000-000000000001']::uuid[])`)).error?.message || ""), "nothing assigned before the payment is approved");
-const cands = (await as(admin, `select client_id, fits from public.crm_lead_candidates('${freeId}')`)).rows;
-check(cands?.length === 31 && cands[0].fits === 3 && cands.at(-1).fits < 3, "candidates: fitting ones first", JSON.stringify(cands?.slice(-1)));
-const ids = cands.filter((c) => c.fits === 3).slice(0, 12).map((c) => `'${c.client_id}'`).join(",");
-const given = one(await as(admin, `select public.crm_lead_assign('${freeId}', array[${ids}]::uuid[])`));
-check(given === 10, "12 picked, only 10 given (the pack)", String(given));
-check(one(await as(admin, `select status from public.partner_lead_requests where id = '${freeId}'`)) === "fulfilled", "and the request is fulfilled");
-check((await db.query(`select count(*)::int n from public.partner_notifications where broker_id = '${B1}' and kind = 'leads_assigned'`)).rows[0].n === 1, "the broker is told");
-check((await db.query(`select count(*)::int n from public.crm_activities where body like 'Shared with partner broker Asha%'`)).rows[0].n === 10, "each client's CRM timeline says so");
+check(reqs?.length === 3, "the admin sees all three requests", JSON.stringify(reqs));
+const paidId = paidOk.id, againId = again.id;
+check(/Approve the request first/.test((await as(admin, `select public.crm_lead_assign('${againId}', array['c0000000-0000-0000-0000-000000000001']::uuid[])`)).error?.message || ""), "nothing assigned before the payment is approved");
+await as(admin, `select public.crm_lead_request_decide('${paidId}', true)`);
+const balaGot = (await db.query(`select count(*)::int n from public.partner_lead_assignments where broker_id = '${B2}'`)).rows[0].n;
+check(balaGot === 30 && one(await as(admin, `select status from public.partner_lead_requests where id = '${paidId}'`)) === "fulfilled",
+  "Bala's first ask, payment approved: his 30 given at once", String(balaGot));
+check((await db.query(`select count(*)::int n from public.partner_lead_assignments where broker_id = '${B2}' and client_id = 'd0000000-0000-0000-0000-000000000005'`)).rows[0].n === 0,
+  "the best 30 — the flexible one, with no move-in date, comes last and is left out");
+await as(admin, `select public.crm_lead_request_decide('${againId}', true)`);
+check(one(await as(admin, `select status from public.partner_lead_requests where id = '${againId}'`)) === "open"
+  && (await db.query(`select count(*)::int n from public.partner_lead_assignments where request_id = '${againId}'`)).rows[0].n === 0,
+  "a later request, approved: open for the team to pick, nothing given automatically");
+const cands = (await as(admin, `select client_id, fits from public.crm_lead_candidates('${againId}')`)).rows;
+check(cands?.length === 21 && cands.at(-1).client_id === "d0000000-0000-0000-0000-000000000005", "candidates: not hers already, soonest move-in first", JSON.stringify(cands?.length));
+const ids = cands.slice(0, 12).map((c) => `'${c.client_id}'`).join(",");
+check(one(await as(admin, `select public.crm_lead_assign('${againId}', array[${ids}]::uuid[])`)) === 12, "the team gives the 12 it picked");
 
 console.log("\nthe broker's leads");
-const mine = (await as(asha, "select id, name, phone, status, flat_types from public.partner_my_assigned_leads()")).rows;
-check(mine?.length === 10 && mine[0].phone.startsWith("98765") && mine[0].name.startsWith("Client"), "name and number, once assigned", JSON.stringify(mine?.[0]));
-check((await as(bala, "select * from public.partner_my_assigned_leads()")).rows?.length === 0, "nobody else's");
+const mine = (await as(asha, "select id, name, phone, status, flat_types, pack from public.partner_my_assigned_leads()")).rows;
+check(mine?.length === 22 && mine[0].phone.startsWith("98765") && mine[0].name.startsWith("Client"), "name and number, once assigned", JSON.stringify(mine?.length));
+check((await as(deepa, "select * from public.partner_my_assigned_leads()")).rows?.length === 0, "nobody else's");
 await as(asha, `select public.partner_lead_reach_out('${mine[0].id}', 'whatsapp')`);
 check(one(await as(asha, `select status from public.partner_my_assigned_leads() where id = '${mine[0].id}'`)) === "contacted", "tapping WhatsApp logs it and marks contacted");
 check((await as(bala, `select public.partner_lead_reach_out('${mine[0].id}', 'call')`)).error?.code === "42501", "can't log a reach-out on someone else's lead");
 const cb = (await as(agent, `select broker_name, reach_count from public.crm_client_brokers((select client_id from public.partner_lead_assignments where id = '${mine[0].id}'))`)).rows;
-check(cb?.[0]?.broker_name === "Asha" && cb[0].reach_count === 1, "the CRM sees which broker reached out", JSON.stringify(cb));
+check(cb?.find((r) => r.broker_name === "Asha")?.reach_count === 1, "the CRM sees which broker reached out", JSON.stringify(cb));
 
 console.log("\nPremium partners don't buy packs");
-await db.exec(`insert into public.premium (user_id) values ('${B1}')`);
-check(/Premium partner/.test((await as(asha, "select public.partner_lead_request('paid30', '{}', 'HDFC99887766')")).error?.message || ""), "no ₹2,000 pack for a Premium partner");
-check(/Premium partner/.test((await as(asha, "select public.partner_lead_request('free10')")).error?.message || ""), "nor the free 10");
-await db.exec(`delete from public.premium where user_id = '${B1}'`);
+await db.exec(`insert into public.premium (user_id) values ('${B4}')`);
+check(/Premium partner/.test((await as(deepa, "select public.partner_lead_request('paid30', '{}', 'HDFC99887766')")).error?.message || ""), "no ₹2,000 pack for a Premium partner");
+check(/Premium partner/.test((await as(deepa, "select public.partner_lead_request('free10')")).error?.message || ""), "nor the free 10");
+await db.exec(`delete from public.premium where user_id = '${B4}'`);
 
 console.log("\nat most 3 brokers a lead");
-await as(admin, `select public.crm_lead_request_decide('${paidId}', true)`);
-check(one(await as(admin, `select status from public.partner_lead_requests where id = '${paidId}'`)) === "open", "payment approved: open");
-const first = mine[0].id;
-const cid = one(await as(admin, `select client_id from public.partner_lead_assignments where id = '${first}'`));
-await as(admin, `select public.crm_lead_assign('${paidId}', array['${cid}']::uuid[])`);
 await db.exec(`insert into public.premium (user_id) values ('${B3}')`);
 const c3 = one(await as(chetan, "select public.partner_lead_request('premium')"));
-await as(admin, `select public.crm_lead_assign('${c3.id}', array['${cid}']::uuid[])`);
+check(c3?.status === "fulfilled" && c3.assigned === 10, "Chetan's first Premium ask: 10 at once, nothing to pay", JSON.stringify(c3));
 const d4 = one(await as(deepa, "select public.partner_lead_request('free10')"));
-check(one(await as(admin, `select public.crm_lead_assign('${d4.id}', array['${cid}']::uuid[])`)) === 0, "a fourth broker doesn't get the same client");
-check(!(await as(admin, `select client_id from public.crm_lead_candidates('${d4.id}')`)).rows.some((r) => r.client_id === cid), "nor is it offered");
+const maxBrokers = (await db.query("select max(n)::int m from (select count(*) n from public.partner_lead_assignments group by client_id) x")).rows[0].m;
+check(maxBrokers === 3, "with four brokers asking, no client went to more than 3", String(maxBrokers));
+check(d4?.assigned === 10, "Deepa still gets her 10, all from clients under 3 brokers", JSON.stringify(d4));
+const full = one(await as(admin, "select client_id from public.partner_lead_assignments group by client_id having count(*) = 3 limit 1"));
+check(one(await as(admin, `select public.crm_lead_assign('${againId}', array['${full}']::uuid[])`)) === 0, "the team can't give a client a fourth broker either");
 const after = one(await as(asha, "select public.partner_moveazy_lead_stats()"));
-check(after.total === 30, "and it drops out of the totals brokers see", String(after.total));
+const fullCount = (await db.query("select count(*)::int n from (select client_id from public.partner_lead_assignments group by client_id having count(*) >= 3) x")).rows[0].n;
+check(after.total === 31 - fullCount, "clients with 3 brokers drop out of the totals brokers see", `${after.total} vs ${31 - fullCount}`);
 
 console.log("\nPremium");
-check(c3?.status === "open" && c3.lead_count === 10, "Premium: 10 a request, nothing to pay");
-check(/already have a request/.test((await as(chetan, "select public.partner_lead_request('premium')")).error?.message || ""), "not while the last one is still being filled");
-await db.exec(`update public.partner_lead_requests set status = 'fulfilled' where id = '${c3.id}'`);
-check(/ask again/.test((await as(chetan, "select public.partner_lead_request('premium')")).error?.message || ""), "and then only once every 3 days");
-// Give Chetan 20 Premium leads with no closure.
-await db.exec(`update public.partner_lead_requests set created_at = now() - interval '4 days', status = 'fulfilled' where id = '${c3.id}'`);
+check(/ask again/.test((await as(chetan, "select public.partner_lead_request('premium')")).error?.message || ""), "one Premium request every 3 days");
+// 20 Premium leads and no closure.
+await db.exec(`update public.partner_lead_requests set created_at = now() - interval '4 days' where id = '${c3.id}'`);
 await db.exec(`insert into public.partner_lead_assignments (request_id, client_id, broker_id)
-  select '${c3.id}', id, '${B3}' from public.crm_clients where name like 'Client %' and id <> '${cid}' limit 19`);
+  select '${c3.id}', c.id, '${B3}' from public.crm_clients c
+   where not exists (select 1 from public.partner_lead_assignments a where a.client_id = c.id and a.broker_id = '${B3}') limit 10`);
 const blocked = one(await as(chetan, "select public.partner_lead_request('premium')"));
-check(blocked?.status === "needs_approval", "20 given, no closure: the next request waits for MovEazy", JSON.stringify(blocked));
+check(blocked?.status === "needs_approval" && blocked.assigned === 0, "20 given, no closure: the next request waits for MovEazy", JSON.stringify(blocked));
 
 console.log("\nclosing");
 const prem = one(await as(chetan, "select id from public.partner_my_assigned_leads() limit 1"));
@@ -200,7 +214,7 @@ check(direct?.due_amount === 9000, "Premium, direct with the owner: 30% of the r
 const prem2 = one(await as(chetan, "select id from public.partner_my_assigned_leads() where status <> 'closed' limit 1"));
 const shared = one(await as(chetan, `select public.partner_lead_update('${prem2}', 'closed', 30000, 'shared')`));
 check(shared?.due_amount === 6000, "Premium, more than one broker: 20%", JSON.stringify(shared));
-const freeLead = mine[1].id;
+const freeLead = mine.find((m) => m.pack === "free10").id;
 const freeClose = one(await as(asha, `select public.partner_lead_update('${freeLead}', 'closed', 30000, 'direct')`));
 check(freeClose?.due_amount === 0, "a pack lead was paid for up front: nothing due");
 const dues = (await as(admin, "select broker_name, due_amount from public.crm_lead_closures()")).rows;
@@ -211,6 +225,8 @@ console.log("\npaying online (Razorpay)");
 const E = "b6666666-0000-0000-0000-000000000006";
 await db.exec(`insert into auth.users (id) values ('${E}'); insert into public.broker_partners (user_id, name) values ('${E}', 'Esha')`);
 const esha = { uid: E };
+// Free some clients up, so there's something left to give.
+await db.exec(`delete from public.partner_lead_assignments where broker_id = '${B4}'`);
 const on1 = one(await as(esha, "select public.partner_lead_request('paid30', '{}', '', true)"));
 check(on1?.status === "awaiting_payment" && on1.amount === 2000, "online: waits for Razorpay, no UTR needed", JSON.stringify(on1));
 const on2 = one(await as(esha, "select public.partner_lead_request('paid30', '{}', '', true)"));
@@ -221,9 +237,22 @@ await db.exec(`update public.partner_lead_requests set link_id = 'plink_REAL' wh
 const pr = async (link, amt) => (await db.query(`select public.partner_lead_razorpay_paid('${on2.id}', '${link}', 'pay_ABC123', ${amt}) r`)).rows[0].r;
 check(await pr("plink_OTHER", 200000) === "wrong_link", "not our link: ignored");
 check(await pr("plink_REAL", 150000) === "short", "too little: ignored");
-check(await pr("plink_REAL", 200000) === "paid", "paid in full: open for MovEazy to assign");
-check(one(await as(admin, `select status from public.partner_lead_requests where id = '${on2.id}'`)) === "open", "no admin check needed");
+check(await pr("plink_REAL", 200000) === "paid", "paid in full");
+check((await db.query(`select count(*)::int n from public.partner_lead_assignments where request_id = '${on2.id}'`)).rows[0].n > 0,
+  "her first ask, paid online: leads given at once, no admin check");
 check(await pr("plink_REAL", 200000) === "already", "Razorpay retrying changes nothing");
+
+console.log("\nrequests already open when this arrives");
+const F = "b7777777-0000-0000-0000-000000000007";
+await db.exec(`insert into auth.users (id) values ('${F}'); insert into public.broker_partners (user_id, name) values ('${F}', 'Farah')`);
+const waiting = (await db.query(`insert into public.partner_lead_requests (broker_id, pack, lead_count, status) values ('${F}', 'free10', 10, 'open') returning id`)).rows[0].id;
+await db.exec(SQL);
+check((await db.query(`select count(*)::int n from public.partner_lead_assignments where request_id = '${waiting}'`)).rows[0].n === 0,
+  "re-running the file doesn't fill later requests behind the team's back");
+await db.exec("drop function public.lead_auto_assign(uuid, text)");
+await db.exec(SQL);
+check((await db.query(`select count(*)::int n from public.partner_lead_assignments where request_id = '${waiting}' and assigned_by = 'auto · backfill'`)).rows[0].n > 0,
+  "but the first time it arrives, every open request gets its leads");
 
 console.log("\npayment settings");
 check((await as(agent, "select public.crm_set_lead_settings('x@ybl', 2500)")).error?.code === "42501", "only partners.manage changes them");
