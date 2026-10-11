@@ -79,7 +79,6 @@ insert into auth.users (id) values ('${B1}'), ('${B2}'), ('${B3}'), ('${B4}'), (
 insert into public.broker_partners (user_id, name, phone) values ('${B1}', 'Asha', '9876500001'), ('${B2}', 'Bala', '9876500002'),
   ('${B3}', 'Chetan', '9876500003'), ('${B4}', 'Deepa', '9876500004');
 insert into public.broker_partners (user_id, name, status) values ('${PEND}', 'Pending', 'pending');
-insert into public.premium (user_id) values ('${B2}');
 `);
 // 30 MovEazy clients in HSR wanting a 1 BHK, ₹20-35k, moving within 15 days; plus the ones that must not count.
 await db.exec(`
@@ -135,7 +134,6 @@ const paidOk = one(await as(bala, "select public.partner_lead_request('paid30', 
 check(paidOk?.status === "payment_check" && paidOk?.lead_count === 30, "with a UTR: waits for MovEazy to check the payment", JSON.stringify(paidOk));
 check(/already been used/.test((await as(chetan, "select public.partner_lead_request('paid30', '{}', 'AXIS12345678')")).error?.message || ""), "a UTR pays for one pack only");
 check((await as(chetan, "select public.partner_lead_request('premium')")).error?.code === "42501", "unlimited needs Premium");
-
 console.log("\nthe CRM");
 check((await as(agent, "select * from public.crm_lead_requests()")).error?.code === "42501", "an agent without partners.manage can't see requests");
 const reqs = (await as(admin, "select id, pack, status, broker_name from public.crm_lead_requests()")).rows;
@@ -160,6 +158,12 @@ check(one(await as(asha, `select status from public.partner_my_assigned_leads() 
 check((await as(bala, `select public.partner_lead_reach_out('${mine[0].id}', 'call')`)).error?.code === "42501", "can't log a reach-out on someone else's lead");
 const cb = (await as(agent, `select broker_name, reach_count from public.crm_client_brokers((select client_id from public.partner_lead_assignments where id = '${mine[0].id}'))`)).rows;
 check(cb?.[0]?.broker_name === "Asha" && cb[0].reach_count === 1, "the CRM sees which broker reached out", JSON.stringify(cb));
+
+console.log("\nPremium partners don't buy packs");
+await db.exec(`insert into public.premium (user_id) values ('${B1}')`);
+check(/Premium partner/.test((await as(asha, "select public.partner_lead_request('paid30', '{}', 'HDFC99887766')")).error?.message || ""), "no ₹2,000 pack for a Premium partner");
+check(/Premium partner/.test((await as(asha, "select public.partner_lead_request('free10')")).error?.message || ""), "nor the free 10");
+await db.exec(`delete from public.premium where user_id = '${B1}'`);
 
 console.log("\nat most 3 brokers a lead");
 await as(admin, `select public.crm_lead_request_decide('${paidId}', true)`);

@@ -350,6 +350,11 @@ begin
     'budget_max', case when coalesce(p_prefs ->> 'budget_max', '') ~ '^\d{1,7}$' then (p_prefs ->> 'budget_max')::int end
   );
 
+  -- Premium partners get MovEazy leads as part of the plan: no packs to buy.
+  if p_pack in ('free10', 'paid30') and public.partner_has_tier('moveazy_inventory') and not public.is_crm_staff() then
+    raise exception 'As a Premium partner your MovEazy leads are free — use Request leads.' using errcode = '22023';
+  end if;
+
   if p_pack = 'free10' then
     if (allow ->> 'free_used')::boolean then
       raise exception 'Your 10 free leads are already used.' using errcode = '22023';
