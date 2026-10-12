@@ -16,7 +16,8 @@
 --     visits fixed — and a fixed visit moves the assignment to 'visit'.
 --
 -- Replaces partner_curated_open / _act / _mine from partner_launch.sql (open and
--- _act are replaced again by partner_curated_tenant.sql, run after this): run
+-- _act are replaced again by partner_curated_tenant.sql, and _seen by
+-- partner_matcher_edit.sql — run those after this): run
 -- this after it (and after partner_moveazy_leads.sql). Safe to re-run.
 
 begin;
