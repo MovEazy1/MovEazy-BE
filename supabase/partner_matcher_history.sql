@@ -1,9 +1,10 @@
 -- AI Property Matcher, with memory.
 --
 --   · MovEazy tenants assigned to a broker (partner_moveazy_leads.sql) get
---     curated lists too — from any approved partner, not only Premium (lists
---     to a broker's own clients stay Premium). Their list opens without the
---     phone gate: MovEazy already knows who they are.
+--     curated lists too — from any approved partner, not only Premium. A free
+--     partner's lists to their own clients carry their own flats and MovEazy's
+--     (other brokers' flats are Premium). A MovEazy tenant's list opens without
+--     the phone gate: MovEazy already knows who they are.
 --   · Never suggest a flat twice. partner_matcher_seen() gives, per tenant,
 --     every flat this broker already sent them; every flat the same mobile
 --     liked or skipped on ANY partner's list; and, from MovEazy, every flat
@@ -142,8 +143,10 @@ begin
   end if;
 
   if p_lead is not null then
-    if not public.partner_has_tier('moveazy_inventory') then
-      raise exception 'Curated lists come with a Premium plan.' using errcode = '42501';
+    -- Free partners send their own flats and MovEazy's; other brokers' flats come with Premium.
+    if not public.partner_has_tier('moveazy_inventory')
+       and exists (select 1 from public.partner_inventory() i where i.property_id = any (ids) and i.source not in ('mine', 'moveazy')) then
+      raise exception 'Other brokers'' flats come with Premium — send your own flats and MovEazy''s.' using errcode = '42501';
     end if;
     select name into lname from public.partner_leads where id = p_lead and broker_id = auth.uid();
     if not found then raise exception 'That lead is not yours.' using errcode = '42501'; end if;

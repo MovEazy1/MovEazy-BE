@@ -35,6 +35,9 @@ create table public.broker_partners (user_id uuid primary key, name text default
 create function public.is_approved_partner() returns boolean language sql stable security definer as $$
   select exists (select 1 from public.broker_partners where user_id = auth.uid() and status = 'approved') $$;
 create table public.premium (user_id uuid primary key);
+create table public.inventory (property_id text primary key, area text default '', nearby_areas text[] default '{}', flat_type text default '',
+  rent numeric, status text default 'published');
+create table public.partner_listings (property_id text primary key references public.inventory (property_id), broker_id uuid not null);
 create table public.partner_tiers (tier text primary key, is_free boolean default false);
 insert into public.partner_tiers values ('moveazy_inventory', false);
 -- Paid Premium, as partner_has_paid_premium() reads it; the test grants it through public.premium.
@@ -130,12 +133,23 @@ check((await as({ uid: PEND }, "select public.partner_moveazy_lead_stats()")).er
 check((await as({ role: "anon" }, "select public.partner_moveazy_lead_stats()")).error?.code === "42501", "anon can't");
 check((await as(asha, "select * from public.partner_lead_requests")).rows?.length === 0, "the tables themselves show brokers nothing");
 
-console.log("\na first request: the best leads at once");
-const free = one(await as(asha, `select public.partner_lead_request('free10', '{"areas":["HSR Layout"],"flat_types":["1 BHK"],"budget_max":"35000"}')`));
-check(free?.status === "fulfilled" && free?.assigned === 10, "Asha's first ask (10 free): 10 leads given straight away", JSON.stringify(free));
+console.log("\nthe free 10: matched to the broker's own flats");
+const flat = (id, broker, area, type, rent, status = "published") =>
+  db.exec(`insert into public.inventory (property_id, area, flat_type, rent, status) values ('${id}', '${area}', '${type}', ${rent}, '${status}');
+           insert into public.partner_listings (property_id, broker_id) values ('${id}', '${broker}');`);
+await flat("A-1", B1, "HSR Layout", "1 BHK", 28000);
+await flat("A-2", B1, "HSR Layout", "1 BHK", 30000, "rented");
+const noFlats = await as(asha, "select public.partner_lead_request('free10')");
+check(/at least 3 available flats first \(1 of 3 added\)/.test(noFlats.error?.message || ""), "fewer than 3 available flats: asked to add them (a let-out one doesn't count)", noFlats.error?.message);
+check(one(await as(asha, "select public.partner_moveazy_lead_stats()"))?.flats_live === 1, "the stats say how many are live");
+await flat("A-3", B1, "Koramangala", "2 BHK", 60000);
+await flat("A-4", B1, "Whitefield", "3 BHK", 90000);
+const free = one(await as(asha, "select public.partner_lead_request('free10')"));
+check(free?.status === "fulfilled" && free?.assigned === 10, "3 live flats: 10 tenants who fit them, at once", JSON.stringify(free));
 const ashaFirst = (await db.query(`select c.name, a.assigned_by from public.partner_lead_assignments a join public.crm_clients c on c.id = a.client_id where a.broker_id = '${B1}'`)).rows;
-check(ashaFirst.every((r) => r.name.startsWith("Client ")) && ashaFirst.every((r) => r.assigned_by === "auto · first request"),
-  "the best fits for what she asked (HSR, 1 BHK, ≤ ₹35k), marked as given automatically");
+check(ashaFirst.every((r) => r.name.startsWith("Client ")) && ashaFirst.every((r) => r.assigned_by === "auto · fits your flats"),
+  "HSR 1 BHK tenants within budget — her HSR flat's fit — marked as matched to her flats", JSON.stringify(ashaFirst.slice(0, 2)));
+check(one(await as(asha, "select public.partner_free_leads_topup()")) === 0, "already 10: topping up gives nothing");
 check((await db.query(`select count(*)::int n from public.partner_notifications where broker_id = '${B1}' and kind = 'leads_assigned'`)).rows[0].n === 1, "she's told");
 check((await db.query(`select count(*)::int n from public.crm_activities where body like 'Shared with partner broker Asha%'`)).rows[0].n === 10, "each client's CRM timeline says so");
 
@@ -192,6 +206,9 @@ console.log("\nat most 3 brokers a lead");
 await db.exec(`insert into public.premium (user_id) values ('${B3}')`);
 const c3 = one(await as(chetan, "select public.partner_lead_request('premium')"));
 check(c3?.status === "fulfilled" && c3.assigned === 10, "Chetan's first Premium ask: 10 at once, nothing to pay", JSON.stringify(c3));
+await flat("D-1", B4, "HSR Layout", "1 BHK", 25000);
+await flat("D-2", B4, "HSR Layout", "1 BHK", 29000);
+await flat("D-3", B4, "BTM Layout", "1 RK", 12000);
 const d4 = one(await as(deepa, "select public.partner_lead_request('free10')"));
 const maxBrokers = (await db.query("select max(n)::int m from (select count(*) n from public.partner_lead_assignments group by client_id) x")).rows[0].m;
 check(maxBrokers === 3, "with four brokers asking, no client went to more than 3", String(maxBrokers));
@@ -226,6 +243,26 @@ check(freeClose?.due_amount === 0, "a pack lead was paid for up front: nothing d
 const dues = (await as(admin, "select broker_name, due_amount from public.crm_lead_closures()")).rows;
 check(dues?.length === 3 && dues.filter((d) => Number(d.due_amount) > 0).length === 2, "the CRM lists every closure with what's due", JSON.stringify(dues));
 check((await db.query(`select count(*)::int n from public.crm_activities where body like '%due to MovEazy%'`)).rows[0].n === 2, "and the client's timeline records it");
+
+console.log("\nfew fits now, more as flats are added");
+const G = "b8888888-0000-0000-0000-000000000008";
+await db.exec(`insert into auth.users (id) values ('${G}'); insert into public.broker_partners (user_id, name) values ('${G}', 'Gita')`);
+const gita = { uid: G };
+await flat("G-1", G, "Koramangala", "2 BHK", 50000);
+await flat("G-2", G, "Whitefield", "3 BHK", 90000);
+await flat("G-3", G, "Indiranagar", "2 BHK", 70000);
+const g1 = one(await as(gita, "select public.partner_lead_request('free10')"));
+check(g1?.status === "fulfilled" && g1.assigned === 1, "only the one tenant who fits her flats (the Koramangala 2 BHK) — no filler", JSON.stringify(g1));
+check(/already have a request/.test((await as(gita, "select public.partner_lead_request('paid30', '{}', 'GITA12345678')")).error?.message || "") === false,
+  "a part-filled free 10 doesn't block buying the ₹2,000 pack");
+await db.exec(`delete from public.partner_lead_requests where broker_id = '${G}' and pack = 'paid30'`);
+await flat("G-4", G, "HSR Layout", "1 BHK", 27000);
+const topped = one(await as(gita, "select public.partner_free_leads_topup()"));
+const gTotal = (await db.query(`select count(*)::int n from public.partner_lead_assignments where broker_id = '${G}'`)).rows[0].n;
+check(topped > 0 && gTotal <= 10 && gTotal === 1 + topped, "an HSR flat added: more tenants fit, topped up to at most 10", `${topped} / ${gTotal}`);
+check(/already used/.test((await as(gita, "select public.partner_lead_request('free10')")).error?.message || ""), "the free 10 stays once");
+// Give the pool back, so later scenarios have clients under 3 brokers.
+await db.exec(`delete from public.partner_lead_assignments where broker_id = '${G}'`);
 
 console.log("\npaying online (Razorpay)");
 const E = "b6666666-0000-0000-0000-000000000006";

@@ -55,9 +55,10 @@ create function public.partner_has_tier(t text) returns boolean language sql sta
   select exists (select 1 from public.premium where user_id = auth.uid()) $$;
 create table public.inventory (property_id text primary key, title text default '', area text default '', rent numeric, deposit numeric,
   flat_type text default '', bedrooms int, bathrooms int, furnishing text default '', property_type text default '', available_from date,
-  images text[] default '{}', cover_image_url text default '', description text default '', status text default 'published');
-create function public.partner_inventory() returns table (property_id text) language sql stable security definer as $$
-  select i.property_id from public.inventory i where i.status = 'published' and public.is_approved_partner() $$;
+  images text[] default '{}', cover_image_url text default '', description text default '', status text default 'published',
+  src text default 'moveazy');
+create function public.partner_inventory() returns table (property_id text, source text) language sql stable security definer as $$
+  select i.property_id, i.src from public.inventory i where i.status = 'published' and public.is_approved_partner() $$;
 create table public.partner_leads (id uuid primary key default gen_random_uuid(), broker_id uuid, name text, phone text default '',
   status text default 'active');
 create table public.partner_tenants (id uuid primary key default gen_random_uuid(), broker_id uuid, phone text, name text default '');

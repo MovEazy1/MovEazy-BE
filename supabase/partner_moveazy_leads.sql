@@ -223,6 +223,59 @@ as $$
 $$;
 revoke all on function public.moveazy_lead_pool() from public, anon, authenticated;
 
+/** A broker's own flats that are live and not let out — what the free 10 is matched to. */
+create or replace function public.partner_live_flats(p_broker uuid)
+returns int
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select count(*)::int from public.partner_listings pl join public.inventory i on i.property_id = pl.property_id
+   where pl.broker_id = p_broker and i.status = 'published';
+$$;
+revoke all on function public.partner_live_flats(uuid) from public, anon, authenticated;
+
+/**
+ * The free 10, matched to the broker's own live flats: for each MovEazy client
+ * the best fit over those flats — area 2, BHK 1, rent within budget 1 — and
+ * only good fits (their area, and their BHK or budget). Best first, then the
+ * soonest move-in, then the most recently active. Internal.
+ */
+create or replace function public.lead_candidates_for_flats(p_broker uuid)
+returns table (client_id uuid, fits int, property_id text)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with flats as (
+    select i.property_id, lower(coalesce(i.area, '')) as area,
+           array(select lower(x) from unnest(coalesce(i.nearby_areas, '{}')) x) as nearby,
+           lower(coalesce(i.flat_type, '')) as flat_type, i.rent
+      from public.partner_listings pl join public.inventory i on i.property_id = pl.property_id
+     where pl.broker_id = p_broker and i.status = 'published'
+  ), scored as (
+    select p.client_id, p.move_in, p.active_at, f.property_id,
+           (case when exists (select 1 from unnest(p.localities) l where lower(l) = f.area or lower(l) = any (f.nearby)) then 2 else 0 end
+          + case when cardinality(p.flat_types) = 0 or exists (select 1 from unnest(p.flat_types) t where lower(t) = f.flat_type) then 1 else 0 end
+          + case when f.rent is null or coalesce(p.budget_max, p.budget_min) is null
+                      or (f.rent <= coalesce(p.budget_max, p.budget_min * 1.3) * 1.1 and f.rent >= coalesce(p.budget_min, 0) * 0.7)
+                 then 1 else 0 end)::int as fits
+      from public.moveazy_lead_pool() p cross join flats f
+     where p.brokers < 3
+       and not exists (select 1 from public.partner_lead_assignments a where a.client_id = p.client_id and a.broker_id = p_broker)
+  ), best as (
+    select distinct on (s.client_id) s.client_id, s.fits, s.property_id, s.move_in, s.active_at
+      from scored s order by s.client_id, s.fits desc
+  )
+  select b.client_id, b.fits, b.property_id from best b
+   where b.fits >= 3
+   order by b.fits desc, b.move_in nulls last, b.active_at desc
+   limit 300;
+$$;
+revoke all on function public.lead_candidates_for_flats(uuid) from public, anon, authenticated;
+
 /**
  * Paid Premium: the unlimited-leads perk. Trial Premium (partner_trial.sql,
  * plan 'trial') unlocks every other Premium feature but not this one — a
@@ -333,6 +386,9 @@ begin
     'pack_price', (select s.lead_pack_price from public.program_settings s where s.id = 1),
     'upi_id', (select s.lead_upi_id from public.program_settings s where s.id = 1),
     'premium', public.partner_has_paid_premium(),
+    'flats_live', public.partner_live_flats(auth.uid()),
+    'free_given', (select count(*) from public.partner_lead_assignments a join public.partner_lead_requests r on r.id = a.request_id
+                    where r.broker_id = auth.uid() and r.pack = 'free10'),
     'allowance', public.partner_lead_allowance(auth.uid())
   ) into out;
   return out;
@@ -388,7 +444,13 @@ begin
     if (allow ->> 'free_used')::boolean then
       raise exception 'Your 10 free leads are already used.' using errcode = '22023';
     end if;
+    if public.partner_live_flats(me) < 3 and not public.is_crm_staff() then
+      raise exception 'Add at least 3 available flats first (% of 3 added) — MovEazy matches your free leads to them.',
+        public.partner_live_flats(me) using errcode = '22023';
+    end if;
     cnt := 10;
+    -- Matched to their flats, not to what they ask for.
+    prefs := jsonb_build_object('by_flats', true);
   elsif p_pack = 'paid30' and p_online then
     cnt := 30;
     amt := (select s.lead_pack_price from public.program_settings s where s.id = 1);
@@ -422,9 +484,14 @@ begin
   insert into public.partner_lead_requests (broker_id, pack, lead_count, amount, utr, prefs, status)
   values (me, p_pack, cnt, amt, v_utr, prefs, v_status)
   returning * into v_row;
+  -- The free 10: the tenants who fit their flats, now; more as they add flats (partner_free_leads_topup).
+  if v_row.pack = 'free10' and (v_row.prefs ->> 'by_flats')::boolean then
+    given := public.lead_give(v_row.id, array(select c.client_id from public.lead_candidates_for_flats(me) c limit 10), 'auto · fits your flats');
+    update public.partner_lead_requests set status = 'fulfilled', updated_at = now() where id = v_row.id;
+    select * into v_row from public.partner_lead_requests where id = v_row.id;
   -- A partner's first request doesn't wait for anyone: the best leads, now.
   -- (A ₹2,000 pack paid by UTR still waits for the payment to be checked.)
-  if v_row.status = 'open' and public.lead_is_first_request(v_row.id) then
+  elsif v_row.status = 'open' and public.lead_is_first_request(v_row.id) then
     given := public.lead_auto_assign(v_row.id, 'auto · first request');
     select * into v_row from public.partner_lead_requests where id = v_row.id;
   end if;
@@ -578,7 +645,7 @@ begin
   select q.pack into pk from public.partner_lead_requests q where q.id = a.request_id;
   if p_status = 'closed' then
     if coalesce(p_rent, 0) < 1000 then raise exception 'Enter the monthly rent.' using errcode = '22023'; end if;
-    if p_deal not in ('direct', 'shared') then raise exception 'Say how the deal went.' using errcode = '22023'; end if;
+    if coalesce(p_deal, '') not in ('direct', 'shared') then raise exception 'Say how the deal went.' using errcode = '22023'; end if;
     if pk = 'premium' then due := round(p_rent * case when p_deal = 'direct' then 0.30 else 0.20 end); end if;
   end if;
   update public.partner_lead_assignments set
@@ -740,7 +807,7 @@ declare
 begin
   select * into q from public.partner_lead_requests where id = p_request for update;
   if q.id is null then raise exception 'No such request.' using errcode = '22023'; end if;
-  if q.status <> 'open' then
+  if q.status <> 'open' and not (q.pack = 'free10' and coalesce((q.prefs ->> 'by_flats')::boolean, false) and q.status = 'fulfilled') then
     raise exception 'Approve the request first (it is %).', q.status using errcode = '22023';
   end if;
   room := q.lead_count - (select count(*) from public.partner_lead_assignments a where a.request_id = q.id);
@@ -771,6 +838,35 @@ begin
 end;
 $$;
 revoke all on function public.lead_give(uuid, uuid[], text) from public, anon, authenticated;
+
+/**
+ * The free 10, topped up: more tenants who fit the broker's flats, up to 10 in
+ * all. The app calls it when the MovEazy leads tab opens and after a flat is
+ * added. → how many were given now.
+ */
+create or replace function public.partner_free_leads_topup()
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  q    public.partner_lead_requests;
+  room int;
+begin
+  if not public.is_approved_partner() then return 0; end if;
+  select * into q from public.partner_lead_requests r
+   where r.broker_id = auth.uid() and r.pack = 'free10' and coalesce((r.prefs ->> 'by_flats')::boolean, false)
+     and r.status in ('open', 'fulfilled')
+   order by r.created_at desc limit 1;
+  if q.id is null then return 0; end if;
+  room := q.lead_count - (select count(*) from public.partner_lead_assignments a where a.request_id = q.id);
+  if room <= 0 then return 0; end if;
+  return public.lead_give(q.id, array(select c.client_id from public.lead_candidates_for_flats(auth.uid()) c limit room), 'auto · fits your flats');
+end;
+$$;
+revoke all on function public.partner_free_leads_topup() from public, anon;
+grant execute on function public.partner_free_leads_topup() to authenticated;
 
 /** The CRM picking clients for a request. */
 create or replace function public.crm_lead_assign(p_request uuid, p_clients uuid[])
