@@ -35,6 +35,12 @@ create table public.broker_partners (user_id uuid primary key, name text default
 create function public.is_approved_partner() returns boolean language sql stable security definer as $$
   select exists (select 1 from public.broker_partners where user_id = auth.uid() and status = 'approved') $$;
 create table public.premium (user_id uuid primary key);
+create table public.partner_tiers (tier text primary key, is_free boolean default false);
+insert into public.partner_tiers values ('moveazy_inventory', false);
+-- Paid Premium, as partner_has_paid_premium() reads it; the test grants it through public.premium.
+create view public.partner_entitlements as
+  select user_id, 'moveazy_inventory'::text as tier, 'monthly'::text as plan,
+         '-infinity'::timestamptz as starts_at, 'infinity'::timestamptz as ends_at from public.premium;
 create function public.partner_has_tier(t text) returns boolean language sql stable security definer as $$
   select public.is_crm_staff() or exists (select 1 from public.premium where user_id = auth.uid()) $$;
 create table public.partner_notifications (id bigint generated always as identity primary key, broker_id uuid, kind text

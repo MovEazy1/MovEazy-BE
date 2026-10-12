@@ -301,6 +301,8 @@ begin
 end;
 $$;
 
+-- partner_activate_payment and partner_status are replaced by partner_trial.sql
+-- (Trial Premium); run that after this file.
 /**
  * Turn a payment into premium time. Internal: reached through the Razorpay
  * webhook (partner_razorpay_paid) or a super admin (partner_admin_payment_decide).

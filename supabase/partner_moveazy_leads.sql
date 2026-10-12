@@ -223,6 +223,27 @@ as $$
 $$;
 revoke all on function public.moveazy_lead_pool() from public, anon, authenticated;
 
+/**
+ * Paid Premium: the unlimited-leads perk. Trial Premium (partner_trial.sql,
+ * plan 'trial') unlocks every other Premium feature but not this one — a
+ * trial partner gets MovEazy leads like a free partner.
+ */
+create or replace function public.partner_has_paid_premium()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select public.is_crm_staff()
+      or exists (select 1 from public.partner_tiers t where t.tier = 'moveazy_inventory' and t.is_free)
+      or exists (select 1 from public.partner_entitlements e
+                  where e.user_id = auth.uid() and e.tier = 'moveazy_inventory' and e.plan <> 'trial'
+                    and now() >= e.starts_at and now() < e.ends_at);
+$$;
+revoke all on function public.partner_has_paid_premium() from public, anon;
+grant execute on function public.partner_has_paid_premium() to authenticated;
+
 -- ── What a broker may ask for right now ──────────────────────────────────────
 create or replace function public.partner_lead_allowance(p_broker uuid)
 returns jsonb
@@ -311,7 +332,7 @@ begin
       'unknown', (select count(*) from pool where coalesce(budget_max, budget_min) is null)),
     'pack_price', (select s.lead_pack_price from public.program_settings s where s.id = 1),
     'upi_id', (select s.lead_upi_id from public.program_settings s where s.id = 1),
-    'premium', public.partner_has_tier('moveazy_inventory'),
+    'premium', public.partner_has_paid_premium(),
     'allowance', public.partner_lead_allowance(auth.uid())
   ) into out;
   return out;
@@ -359,7 +380,7 @@ begin
   );
 
   -- Premium partners get MovEazy leads as part of the plan: no packs to buy.
-  if p_pack in ('free10', 'paid30') and public.partner_has_tier('moveazy_inventory') and not public.is_crm_staff() then
+  if p_pack in ('free10', 'paid30') and public.partner_has_paid_premium() and not public.is_crm_staff() then
     raise exception 'As a Premium partner your MovEazy leads are free — use Request leads.' using errcode = '22023';
   end if;
 
@@ -384,7 +405,7 @@ begin
     amt := (select s.lead_pack_price from public.program_settings s where s.id = 1);
     v_status := 'payment_check';
   elsif p_pack = 'premium' then
-    if not public.partner_has_tier('moveazy_inventory') then
+    if not public.partner_has_paid_premium() then
       raise exception 'Unlimited leads come with Premium.' using errcode = '42501';
     end if;
     if allow ->> 'premium_next_at' is not null then

@@ -906,6 +906,7 @@ $$;
 
 -- ── Staff: the CRM's MovEazy partners section ───────────────────────────────
 drop function if exists public.partner_admin_list();
+-- Replaced by partner_trial.sql (Trial Premium); run that after this file.
 create function public.partner_admin_list()
 returns table (user_id uuid, name text, phone text, email text, agency text, status text,
                created_at timestamptz, approved_at timestamptz, approved_by text,
@@ -983,6 +984,7 @@ end;
 $$;
 
 /** Manual premium until the gateway lands: grant N months, or revoke (p_months = 0). */
+-- Replaced by partner_trial.sql (Trial Premium); run that after this file.
 create or replace function public.partner_admin_grant_tier(p_user uuid, p_tier text, p_months int)
 returns void
 language plpgsql
