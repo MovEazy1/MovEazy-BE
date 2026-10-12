@@ -873,6 +873,8 @@ begin
 end;
 $$;
 
+-- partner_curated_open / _act / _mine are replaced by partner_matcher_history.sql
+-- (MovEazy-assigned tenants); run that after this file.
 /** The tenant's page, by the link's token. Public columns only; opening is counted. */
 create or replace function public.partner_curated_open(p_token text)
 returns jsonb
