@@ -63,23 +63,26 @@ for (const n of [1, 2, 5]) {
 check((await row(3)).status === "fresh", "a lead with a mobile is left open");
 check((await row(4)).status === "closed_by_us", "a deal we closed is left alone");
 check((await row(6)).closed_reason === "Went with a broker", "one already closed outside keeps its reason");
-const acts = (await db.query("select count(*)::int n from public.crm_activities where meta->>'source' = 'no_mobile_close'")).rows[0].n;
-check(acts === 3, "each one noted on its timeline", acts);
+const acts = (await db.query("select count(*)::int n from public.crm_activities where meta->>'source' = 'no_mobile_close' and type = 'system' and actor_email = 'system'")).rows[0].n;
+check(acts === 3, "each one noted on its timeline — as a system entry, so the CRM doesn't count it as contact", acts);
 const prof = (await db.query("select count(*)::int n from public.user_profiles where search_status <> 'searching'")).rows[0].n;
 check(prof === 0, "their site profiles are untouched — CRM only");
 
 await db.exec(`insert into public.user_profiles (id, email) values ('${U(4)}', 'deepa@x');
 insert into public.crm_clients (id, user_id, name, phone) values ('c0000000-0000-0000-0000-000000000007', '${U(4)}', 'New signup', '');`);
+await db.exec(`update public.crm_activities set type = 'status' where meta->>'source' = 'no_mobile_close'`);
 await db.exec(SQL);
 check((await row(7)).status === "fresh", "re-applying doesn't close later sign-ups");
+const fixed = (await db.query("select count(*)::int n from public.crm_activities where meta->>'source' = 'no_mobile_close' and type = 'status'")).rows[0].n;
+check(fixed === 0, "re-applying turns notes the first version wrote as 'status' into system entries", fixed);
 
 console.log("\ncoming back with a number");
 await db.exec(`update public.user_profiles set phone = '+91 91234 56789' where id = '${U(1)}'`);
 let r = await row(1);
 check(r.status === "fresh" && r.phone === "9123456789" && r.closed_at === null && r.closed_reason === "",
   "typing a mobile on the site makes them a Fresh lead again", JSON.stringify(r));
-const back = (await db.query("select body from public.crm_activities where client_id = 'c0000000-0000-0000-0000-000000000001' and meta->>'source' = 'no_mobile_reopen'")).rows;
-check(back.length === 1, "…and says so on their timeline");
+const back = (await db.query("select type from public.crm_activities where client_id = 'c0000000-0000-0000-0000-000000000001' and meta->>'source' = 'no_mobile_reopen'")).rows;
+check(back.length === 1 && back[0].type === "system", "…and says so on their timeline (system, so they land in Fresh, not Contacted)");
 
 await db.exec(`update public.crm_clients set phone = '9000000002' where id = 'c0000000-0000-0000-0000-000000000002'`);
 check((await row(2)).status === "fresh", "the team adding a number reopens them too");

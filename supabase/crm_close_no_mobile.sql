@@ -11,6 +11,10 @@
 --
 -- The one-time close runs only on the first apply; re-running leaves later
 -- sign-ups without a number open for the team to follow up.
+--
+-- The timeline notes are 'system' entries, never 'status': the CRM reads a
+-- staff 'status' activity as "we contacted them" (crmLeadBuckets.js), which
+-- would file every one of these under Contacted.
 
 begin;
 
@@ -33,7 +37,7 @@ begin
     new.closed_reason := '';
     new.updated_at    := now();
     insert into public.crm_activities (client_id, actor_email, type, body, meta)
-    values (new.id, 'system', 'status', 'Closed outside → Fresh · gave a mobile number',
+    values (new.id, 'system', 'system', 'Closed outside → Fresh · gave a mobile number',
             jsonb_build_object('source', 'no_mobile_reopen'));
   end if;
   return new;
@@ -45,6 +49,12 @@ drop trigger if exists crm_clients_reopen_when_mobile on public.crm_clients;
 create trigger crm_clients_reopen_when_mobile
   before update of phone on public.crm_clients
   for each row execute function public.crm_reopen_when_mobile();
+
+-- Notes written as 'status' by the first version of this file → 'system'.
+update public.crm_activities
+   set type = 'system'
+ where type = 'status' and actor_email = 'system'
+   and meta ->> 'source' in ('no_mobile_close', 'no_mobile_reopen');
 
 -- Once: every open lead with no usable mobile.
 do $$
@@ -58,7 +68,7 @@ begin
       returning c.id
     )
     insert into public.crm_activities (client_id, actor_email, type, body, meta)
-    select id, 'system', 'status', 'Closed outside · No mobile number',
+    select id, 'system', 'system', 'Closed outside · No mobile number',
            jsonb_build_object('source', 'no_mobile_close')
       from closed;
   end if;
