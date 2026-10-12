@@ -21,6 +21,9 @@
 -- demand, and the CRM's clients are tenants.
 --
 -- Run once in the Supabase SQL editor. Safe to re-run.
+--
+-- Partners: crm_partners_not_leads.sql (run after this) keeps partner-only
+-- sign-ups out of the leads this trigger and the backfill below create.
 
 
 create or replace function public.crm_lead_from_profile_phone()
