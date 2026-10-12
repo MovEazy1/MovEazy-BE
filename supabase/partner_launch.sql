@@ -257,6 +257,8 @@ create index if not exists partner_payments_user_idx on public.partner_payments 
 create index if not exists partner_payments_status_idx on public.partner_payments (status, created_at desc);
 create unique index if not exists partner_payments_link_once on public.partner_payments (link_id) where link_id <> '';
 
+-- partner_plans_list, partner_referral_code and partner_my_referrals are replaced by
+-- partner_premium_upi.sql (UPI payments, per-plan referral rewards); run that after this file.
 /** The plans a broker can buy, cheapest first. */
 create or replace function public.partner_plans_list()
 returns jsonb

@@ -360,6 +360,7 @@ $$;
 
 -- ── Paid Premium takes over a trial ─────────────────────────────────────────
 
+-- Replaced again by partner_premium_upi.sql (per-plan referral rewards); run that after this file.
 /** As in partner_launch.sql, plus: a running trial ends and its unused days are added on. */
 create or replace function public.partner_activate_payment(p_payment uuid, p_source text, p_gateway_payment text, p_actor text)
 returns public.partner_payments
