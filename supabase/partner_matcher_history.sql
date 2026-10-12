@@ -15,7 +15,8 @@
 --   · MovEazy's CRM sees it on the client's timeline: lists sent, likes,
 --     visits fixed — and a fixed visit moves the assignment to 'visit'.
 --
--- Replaces partner_curated_open / _act / _mine from partner_launch.sql: run
+-- Replaces partner_curated_open / _act / _mine from partner_launch.sql (open and
+-- _act are replaced again by partner_curated_tenant.sql, run after this): run
 -- this after it (and after partner_moveazy_leads.sql). Safe to re-run.
 
 begin;

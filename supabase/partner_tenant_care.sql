@@ -444,7 +444,7 @@ begin
     select jsonb_build_object('at', cl.opened_at, 'kind', 'opened', 'text', 'Opened your list', 'list_id', cl.id)
       from public.partner_curated_lists cl where cl.id = any (lists) and cl.opened_at is not null
     union all
-    select jsonb_build_object('at', a.at, 'kind', a.action, 'text', case when a.action = 'liked' then 'Liked ' else 'Skipped ' end || public.partner_flat_line(a.property_id),
+    select jsonb_build_object('at', a.at, 'kind', a.action, 'text', case when a.action = 'liked' then 'Liked ' else 'Disliked ' end || public.partner_flat_line(a.property_id),
              'property_id', a.property_id)
       from public.partner_curated_actions a where a.list_id = any (lists)
     union all
