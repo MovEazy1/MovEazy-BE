@@ -20,6 +20,8 @@
 --
 -- Run in the Supabase SQL editor AFTER crm_phone_leads.sql, partner_schema.sql
 -- and partner_moveazy_leads.sql. Safe to re-run.
+-- society_app.sql (run after this) extends crm_partner_not_searching to
+-- society members; re-run it after this file.
 
 begin;
 
