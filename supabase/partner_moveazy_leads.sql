@@ -951,7 +951,9 @@ end;
 $$;
 
 /** Every MovEazy lead a broker closed, with what's due to MovEazy. */
-create or replace function public.crm_lead_closures()
+-- Replaced by partner_referral_commission.sql (received + referral commission); dropped first so a re-run here works.
+drop function if exists public.crm_lead_closures();
+create function public.crm_lead_closures()
 returns table (assignment_id uuid, client_id uuid, client_name text, broker_name text, broker_phone text, pack text,
                closed_rent numeric, deal_type text, due_amount numeric, closed_at timestamptz)
 language plpgsql
