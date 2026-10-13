@@ -13,6 +13,8 @@
 -- Replaces partner_storefront and partner_storefront_rate
 -- (partner_storefront.sql) and partner_admin_list
 -- (partner_referral_commission.sql): run this after those. Safe to re-run.
+-- partner_contact_phone.sql replaces partner_storefront and partner_admin_list
+-- again (the primary contact number): re-run it after this file.
 
 begin;
 
