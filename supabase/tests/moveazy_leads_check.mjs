@@ -11,7 +11,9 @@ process.on("unhandledRejection", (e) => {
   console.error(`\nFAILED TO APPLY: ${e?.message}${e?.where ? `\n  at ${e.where}` : ""}`);
   process.exit(1);
 });
-const SQL = readFileSync(new URL("../partner_moveazy_leads.sql", import.meta.url), "utf8");
+// The totals partners see are overridden by partner_lead_stats_total.sql (the whole book), applied after it.
+const SQL = readFileSync(new URL("../partner_moveazy_leads.sql", import.meta.url), "utf8")
+  + "\n" + readFileSync(new URL("../partner_lead_stats_total.sql", import.meta.url), "utf8");
 
 let passed = true;
 const check = (ok, why, extra = "") => {
@@ -123,10 +125,10 @@ const agent = { uid: "a0000000-0000-0000-0000-000000000002", email: "agent@movea
 
 console.log("\nwhat brokers see");
 const stats = one(await as(asha, "select public.partner_moveazy_lead_stats()"));
-check(stats?.total === 31, "31 open MovEazy clients with something to go on, active lately (not a broker's own, closed, empty or quiet ones)", JSON.stringify(stats?.total));
+check(stats?.total === 34, "all 34 MovEazy clients — closed, empty and quiet ones too (not a broker's own)", JSON.stringify(stats?.total));
 check(stats?.bhk_area?.[0]?.bhk === "1 BHK" && stats.bhk_area[0].area === "HSR Layout" && stats.bhk_area[0].n === 30, "top set: 30 looking for a 1 BHK in HSR Layout", JSON.stringify(stats?.bhk_area?.[0]));
-check(stats?.move_in?.week === 0 && stats?.move_in?.month === 30 && stats?.move_in?.flexible === 1, "move-in buckets", JSON.stringify(stats?.move_in));
-check(stats?.budget?.b20_35 === 30 && stats?.budget?.b50plus === 1, "budget bands", JSON.stringify(stats?.budget));
+check(stats?.move_in?.week === 0 && stats?.move_in?.month === 30 && stats?.move_in?.flexible === 4, "move-in buckets (no date = flexible)", JSON.stringify(stats?.move_in));
+check(stats?.budget?.b20_35 === 32 && stats?.budget?.b50plus === 1 && stats?.budget?.unknown === 1, "budget bands over the same clients", JSON.stringify(stats?.budget));
 check(stats?.pack_price === 2000 && stats?.upi_id === "8090911024@pthdfc", "price and UPI to pay");
 check(!JSON.stringify(stats).includes("98765") && !JSON.stringify(stats).includes("Client 1"), "no number, no name anywhere in it");
 check((await as({ uid: PEND }, "select public.partner_moveazy_lead_stats()")).error?.code === "42501", "a broker not yet approved can't");
@@ -217,7 +219,7 @@ const full = one(await as(admin, "select client_id from public.partner_lead_assi
 check(one(await as(admin, `select public.crm_lead_assign('${againId}', array['${full}']::uuid[])`)) === 0, "the team can't give a client a fourth broker either");
 const after = one(await as(asha, "select public.partner_moveazy_lead_stats()"));
 const fullCount = (await db.query("select count(*)::int n from (select client_id from public.partner_lead_assignments group by client_id having count(*) >= 3) x")).rows[0].n;
-check(after.total === 31 - fullCount, "clients with 3 brokers drop out of the totals brokers see", `${after.total} vs ${31 - fullCount}`);
+check(fullCount > 0 && after.total === 34, "clients with 3 brokers still count in the book brokers see", `${after.total}, ${fullCount} full`);
 
 console.log("\nPremium");
 check(/ask again/.test((await as(chetan, "select public.partner_lead_request('premium')")).error?.message || ""), "one Premium request every 3 days");
@@ -303,6 +305,15 @@ check(/UPI ID/.test((await as(admin, "select public.crm_set_lead_settings('not a
 await as(admin, "select public.crm_set_lead_settings('moveazy@icici', 2500)");
 const s2 = one(await as(asha, "select public.partner_moveazy_lead_stats()"));
 check(s2.upi_id === "moveazy@icici" && s2.pack_price === 2500, "brokers pay the new UPI ID and price");
+
+console.log("\nthe whole book");
+const before = one(await as(asha, "select public.partner_moveazy_lead_stats()"));
+await db.exec(`insert into public.crm_clients (id, name, status) values ('d0000000-0000-0000-0000-000000000009', 'Moved long ago', 'closed_outside');
+insert into public.crm_client_requirements (client_id, move_in) values ('d0000000-0000-0000-0000-000000000009', '2020-01-05');`);
+const grown = one(await as(asha, "select public.partner_moveazy_lead_stats()"));
+check(grown.total === before.total + 1, "a new client counts the next time the app asks", `${before.total} → ${grown.total}`);
+check(grown.move_in.week === before.move_in.week && grown.move_in.flexible === before.move_in.flexible + 1,
+  "a move-in date already past is 'flexible', never 'within a week'", JSON.stringify(grown.move_in));
 
 console.log(passed ? "\nALL CHECKS PASSED" : "\nSOME CHECKS FAILED");
 process.exit(passed ? 0 : 1);

@@ -342,7 +342,8 @@ revoke all on function public.partner_lead_allowance(uuid) from public, anon, au
 
 -- ── Broker side ──────────────────────────────────────────────────────────────
 
-/** The totals, the price and UPI to pay, and what this broker may ask for. Never a lead. */
+/** The totals, the price and UPI to pay, and what this broker may ask for. Never a lead.
+    Superseded by partner_lead_stats_total.sql: the totals cover MovEazy's whole book. */
 create or replace function public.partner_moveazy_lead_stats()
 returns jsonb
 language plpgsql
