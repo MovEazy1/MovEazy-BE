@@ -127,7 +127,7 @@ check(r.error == null && (await notes()).length === 4 && /messaged about your 2 
 r = await as({ uid: T1, email: "t1@x.in" }, "select public.flat_contact_tap('A2', 'callback')");
 check(r.error == null && /asked you to call them/.test((await notes()).at(-1).body), "asked to be called back", (await notes()).at(-1).body);
 r = await as({ uid: T1, email: "t1@x.in" }, "select public.website_match_flats(array['M1', 'A2', 'A1', 'A2'])");
-check(r.error == null && one(r) === 3 && (await notes()).some((x) => /is looking for a flat like your 1 BHK/.test(x.title)), "a match: only partner flats, at most 3", r.error?.message);
+check(r.error == null && one(r) === 0 && !(await notes()).some((x) => /looking for a flat like/.test(x.title)), "a requirement that only fits: no lead, no bell", r.error?.message);
 
 console.log("\nopening a flat");
 r = await as({ uid: T1, email: "t1@x.in" }, "select public.flat_view('A2', 'device-0001', 'link')");

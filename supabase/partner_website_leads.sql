@@ -18,8 +18,7 @@
 --            on the same phone and claimed on sign-in (flat_claim_views)
 --   contact  "Ask the broker to call me" on the flat's page, or WhatsApp / Call
 --            tapped there (flat_contact_tap)
---   match    the flat is among the best fits for a tenant's requirement
---            (score 70+, website_match_flats from the first-5 screen)
+--   (A requirement that only fits a flat is not interest: no lead for that.)
 -- The tenant needs a mobile number on their CRM client, and must be MovEazy's
 -- (attributed_to 'moveazy'): a tenant another broker brought stays theirs.
 --
@@ -393,28 +392,14 @@ end;
 $$;
 
 /** The first-5 screen: partner flats that fit this tenant at 70+ (best first, at most 3). */
+-- Retired: a requirement that merely fits a partner's flat is not interest, and
+-- never gives the partner a lead. Kept (doing nothing) for any open tab that
+-- still calls it.
 create or replace function public.website_match_flats(p_properties text[])
 returns int
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  uid uuid := auth.uid();
-  pid text;
-  n   int := 0;
-begin
-  if uid is null or not exists (select 1 from public.user_requirements r where r.user_id = uid) then return 0; end if;
-  foreach pid in array coalesce(p_properties, '{}') loop
-    exit when n >= 3;
-    continue when not exists (select 1 from public.partner_listings pl join public.inventory i on i.property_id = pl.property_id
-                               where pl.property_id = pid and i.status = 'published');
-    perform public.website_lead_for_user(uid, pid, 'match', 'fits their requirement');
-    n := n + 1;
-  end loop;
-  return n;
-end;
-$$;
+language sql
+stable
+as $$ select 0; $$;
 
 /** Partners' live flats, and those of partners on trial or Premium (ranked up). Public: ids only. */
 create or replace function public.partner_flat_ids()
