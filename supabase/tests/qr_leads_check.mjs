@@ -140,7 +140,7 @@ check(ck.length === 1 && ck[0].locality === "HSR Layout" && ck[0].spot_id && ck[
 check(await q1(`select count(*)::int from public.partner_tenants where source = 'storefront'`) === 1, "and the broker's tenant (CRM → Broker leads)");
 let n = (await db.query(`select * from public.partner_notifications order by id`)).rows;
 check(n.length === 1 && n[0].kind === "storefront_lead" && /Ravi Kumar scanned your QR/.test(n[0].title) && /HSR Layout/.test(n[0].body)
-  && n[0].link === `/tenants/lead-${lead[0].id}`, "the bell: scanned your QR, with the requirement and a link", JSON.stringify(n[0]));
+  && n[0].link === `/tenants/lead-${lead[0].id}` && !/9845012345/.test(n[0].body), "the bell: scanned your QR, the requirement, a link — not the number", JSON.stringify(n[0]));
 let crm = (await db.query(`select * from public.crm_clients where user_id = '${TEN}'`)).rows[0];
 check(crm.via === "qr" && crm.via_broker === BROKER && crm.attributed_to === BROKER, "CRM: today's sign-up tagged QR and the broker's (out of the pool)");
 check(/Scanned Asha's QR poster/.test(await q1(`select body from public.crm_activities order by created_at limit 1`)), "CRM activity logged");

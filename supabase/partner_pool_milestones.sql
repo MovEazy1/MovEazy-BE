@@ -583,6 +583,50 @@ begin
 end;
 $$;
 
+-- (partner_moveazy_leads.sql) A milestone reward still filling isn't an open request of theirs.
+create or replace function public.partner_lead_allowance(p_broker uuid)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  free_used boolean;
+  open_req  jsonb;
+  last_prem timestamptz;
+  given     int;
+  closed    int;
+begin
+  select exists (select 1 from public.partner_lead_requests q
+                  where q.broker_id = p_broker and q.pack = 'free10' and q.status not in ('rejected', 'cancelled'))
+    into free_used;
+  select jsonb_build_object('id', q.id, 'pack', q.pack, 'status', q.status) into open_req
+    from public.partner_lead_requests q
+   where q.broker_id = p_broker and q.status in ('payment_check', 'needs_approval', 'open')
+     and q.pack not in ('website', 'milestone') -- rewards still filling never hold up a request
+   order by q.created_at desc limit 1;
+  -- An online payment started and never finished doesn't hold anything up.
+  select max(q.created_at) into last_prem from public.partner_lead_requests q
+   where q.broker_id = p_broker and q.pack = 'premium' and q.status not in ('rejected', 'cancelled');
+  select count(*) filter (where true), count(*) filter (where a.status = 'closed')
+    into given, closed
+    from public.partner_lead_assignments a
+    join public.partner_lead_requests q on q.id = a.request_id
+   where a.broker_id = p_broker and q.pack = 'premium';
+  return jsonb_build_object(
+    'free_used', free_used,
+    'open_request', open_req,
+    'premium_next_at', case when last_prem > now() - interval '3 days' then last_prem + interval '3 days' end,
+    'premium_given', given,
+    'premium_closed', closed,
+    -- Every 20 given needs a closure; past that MovEazy decides.
+    'premium_needs_approval', given >= 20 * (closed + 1)
+  );
+end;
+$$;
+revoke all on function public.partner_lead_allowance(uuid) from public, anon, authenticated;
+
 -- ── 3. The CRM: each partner's leads ────────────────────────────────────────
 
 /**

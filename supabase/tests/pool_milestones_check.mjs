@@ -203,6 +203,8 @@ pr = one(r);
 check(r.error == null && pr.complete === 20 && pr.next == null && pr.milestones.map((m) => m.milestone).join() === "3,10,20"
   && pr.milestones[2].given === 20 && pr.milestones[1].awarded_at == null, "20 complete: 20 more leads; 10 has no reward", JSON.stringify(pr.milestones));
 
+r = { rows: (await db.query(`select public.partner_lead_allowance('${A}') as x`)).rows, error: null };
+check(r.error == null && one(r).open_request == null, "an unfilled milestone request never blocks asking for leads", r.error?.message ?? JSON.stringify(one(r)));
 console.log("\na free partner");
 await db.exec(`insert into public.inventory (property_id, ${full}) select 'F' || g, 20000, '1 BHK', 'BTM Layout', 'x.jpg', '{y.jpg,z.jpg}', 'Full', 50000, '', '', null, null, '', ''
   from generate_series(1, 3) g; insert into public.partner_listings select 'F' || g, '${F}' from generate_series(1, 3) g`);

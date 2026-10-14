@@ -312,7 +312,7 @@ begin
                  nullif(loc, ''), case when imm then 'Immediate move-in' end);
     insert into public.partner_notifications (broker_id, kind, title, body, link)
     values (p_broker, 'storefront_lead', nm || ' scanned your QR — added to My leads',
-            concat_ws(' — ', nullif(summary, ''), ph), public.partner_tenant_link(lid, null));
+            concat_ws(' — ', nullif(summary, ''), 'WhatsApp or call them from the app'), public.partner_tenant_link(lid, null));
     perform public.partner_qr_crm(p_broker, p_user, ph, nm, up.email,
       'Scanned ' || coalesce(nullif(bname, ''), 'a partner') || '''s QR poster' || coalesce(' · ' || nullif(summary, ''), ''));
   else
@@ -429,7 +429,7 @@ begin
     insert into public.partner_notifications (broker_id, kind, title, body, link)
     values (bid, 'storefront_visit',
             left(coalesce(nullif(btrim(up.name), ''), 'A tenant'), 80) || ' wants to visit your flat',
-            concat_ws(' — ', nullif(flat, ''), public.normalize_mobile(up.phone)), public.partner_tenant_link(lid, null));
+            concat_ws(' — ', nullif(flat, ''), 'WhatsApp or call them from the app'), public.partner_tenant_link(lid, null));
     select name into bname from public.broker_partners where user_id = bid;
     perform public.partner_qr_crm(bid, uid, public.normalize_mobile(up.phone), up.name, up.email,
       'Asked ' || coalesce(nullif(bname, ''), 'a partner') || ' (QR) for a visit · ' || coalesce(nullif(flat, ''), p_property));
@@ -439,6 +439,34 @@ begin
     'broker', (select jsonb_build_object('name', p.name, 'phone', public.partner_contact_phone(p.user_id))
                  from public.broker_partners p where p.user_id = bid),
     'home', jsonb_build_object('property_id', h.property_id, 'flat_type', h.flat_type, 'area', h.area, 'rent', h.rent));
+end;
+$$;
+
+-- (partner_launch.sql) A like on the QR page: the bell names the flat, not the tenant's number —
+-- partners reach tenants from the app's WhatsApp / Call buttons, so every reach-out is logged.
+create or replace function public.partner_storefront_like_notify()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  up public.user_profiles;
+  h  public.inventory;
+  ph text;
+begin
+  select * into up from public.user_profiles where id = new.user_id;
+  ph := public.normalize_mobile(coalesce(up.phone, ''));
+  if ph <> '' then
+    insert into public.partner_tenants as pt (broker_id, phone, name, source)
+    values (new.broker_id, ph, left(coalesce(up.name, ''), 120), 'storefront')
+    on conflict (broker_id, phone) do update set last_seen_at = now();
+  end if;
+  select * into h from public.inventory where property_id = new.property_id;
+  insert into public.partner_notifications (broker_id, kind, title, body, link)
+  values (new.broker_id, 'storefront_like', coalesce(nullif(up.name, ''), 'A tenant') || ' liked a home on your QR page',
+          concat_ws(' · ', nullif(h.flat_type, ''), nullif(h.area, '')) || ' — WhatsApp or call them from the app', '/qr');
+  return new;
 end;
 $$;
 
