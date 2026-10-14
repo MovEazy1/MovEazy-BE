@@ -16,7 +16,8 @@
 --            crm_shortlists 'visit_scheduled')
 --   opened   the flat's page opened while signed in (flat_view), or earlier
 --            on the same phone and claimed on sign-in (flat_claim_views)
---   contact  WhatsApp / Call tapped on the flat's page (flat_contact_tap)
+--   contact  "Ask the broker to call me" on the flat's page, or WhatsApp / Call
+--            tapped there (flat_contact_tap)
 --   match    the flat is among the best fits for a tenant's requirement
 --            (score 70+, website_match_flats from the first-5 screen)
 -- The tenant needs a mobile number on their CRM client, and must be MovEazy's
@@ -377,7 +378,7 @@ begin
 end;
 $$;
 
-/** WhatsApp or Call tapped on a flat's page by a signed-in tenant. */
+/** A signed-in tenant on a flat's page: "Ask the broker to call me" (callback), or WhatsApp / Call tapped. */
 create or replace function public.flat_contact_tap(p_property text, p_channel text default 'whatsapp')
 returns void
 language plpgsql
@@ -387,7 +388,7 @@ as $$
 begin
   if auth.uid() is null then return; end if;
   perform public.website_lead_for_user(auth.uid(), upper(trim(coalesce(p_property, ''))), 'contact',
-    case when p_channel = 'call' then 'tapped Call' else 'tapped WhatsApp' end);
+    case p_channel when 'callback' then 'asked you to call them' when 'call' then 'tapped Call' else 'tapped WhatsApp' end);
 end;
 $$;
 
