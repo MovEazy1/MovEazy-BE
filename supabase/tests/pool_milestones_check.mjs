@@ -57,7 +57,7 @@ create table public.inventory (property_id text primary key, status text default
   rent numeric default 0, deposit numeric default 0, available_from date, property_type text default 'Apartment', flat_type text default '',
   bedrooms int, bathrooms int, furnishing text default '', amenities text[] default '{}', description text default '', images text[] default '{}',
   cover_image_url text default '', is_verified boolean default false, poster_name text default '', phone text default '', posted_by text default 'owner',
-  partner_visible boolean default true, rent_flag text default '', created_at timestamptz default now(), updated_at timestamptz default now());
+  partner_visible boolean default true, rent_flag text default '', source text default '', created_at timestamptz default now(), updated_at timestamptz default now());
 create table public.partner_listings (property_id text primary key, broker_id uuid);
 create table public.partner_platform_shares (property_id text primary key, share_pct numeric);
 create table public.partner_groups (id uuid primary key, name text);
@@ -104,6 +104,7 @@ begin
   end loop;
   return n;
 end $$;
+create function public.inventory_from_crm(p text) returns boolean language sql immutable as $$ select coalesce(p, '') in ('crm', 'facebook', 'whatsapp', 'portal', 'other') $$;
 create table public.partner_plans (id text primary key, referral_reward int);
 insert into public.partner_plans values ('trial_1m', 500), ('pro_5m', 1500);
 create table public.partner_referrals (id uuid primary key default gen_random_uuid(), referrer_id uuid, referee_id uuid unique, amount int default 1500);
@@ -171,6 +172,9 @@ r = await as({ uid: G }, "select anonymous from public.partner_inventory() where
 check(r.rows[0].anonymous === true, "still anonymous for everyone else");
 
 console.log("\nmilestones");
+// A complete flat the CRM added for them: doesn't count.
+await db.exec(`insert into public.inventory (property_id, source, ${full}) values ('C1', 'crm', 25000, '2 BHK', 'HSR Layout', 'a.jpg', '{b.jpg,c.jpg}', 'Semi', 75000, '', '', null, null, '', '');
+  insert into public.partner_listings values ('C1', '${A}')`);
 r = await as(arjun, "select public.partner_upload_progress()");
 let pr = one(r);
 check(r.error == null && pr.complete === 1 && pr.total === 1 && pr.next === 3 && pr.milestones.length === 0, "1 complete flat: next is 3", r.error?.message ?? JSON.stringify(pr));

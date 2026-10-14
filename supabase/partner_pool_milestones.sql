@@ -3,7 +3,8 @@
 -- one-time referral reward retired (fe: lib/partnerPool.js, InventoryHome,
 -- UploadDone, PropertyDetail, CrmPartnersSection, Wallet).
 --
--- Run in the Supabase SQL editor AFTER partner_location.sql (partner_inventory,
+-- Run in the Supabase SQL editor AFTER inventory_partner_hidden.sql
+-- (inventory_from_crm), partner_location.sql (partner_inventory,
 -- partner_property_contacts_for), partner_moveazy_leads.sql (requests,
 -- lead_give, lead_candidates*), partner_website_leads.sql (partner_lead_update)
 -- and partner_referral_commission.sql (partner_premium_at). Safe to re-run.
@@ -22,6 +23,7 @@
 -- 2. Milestones. A flat counts when it is complete: 6 of the 9 details the
 --    app checks, rent, BHK, area and a photo among them. 3 complete flats →
 --    10 MovEazy leads at once, picked for their flats (then their areas);
+--    only flats the partner uploaded count (not ones the CRM added for them);
 --    10 → a milestone with no reward; 20 → 20 fresh leads. Trial and Premium
 --    partners only; a free partner's reward waits until they upgrade.
 --    MovEazy's usual share applies when these close ("milestone" pack).
@@ -462,10 +464,11 @@ declare
   m     record;
 begin
   if not public.is_approved_partner() then raise exception 'Only MovEazy partners.' using errcode = '42501'; end if;
+  -- Only flats they uploaded themselves: not ones the CRM added for them.
   select count(*) filter (where public.partner_flat_complete(i)), count(*)
     into n, total
     from public.partner_listings pl join public.inventory i on i.property_id = pl.property_id
-   where pl.broker_id = uid;
+   where pl.broker_id = uid and not public.inventory_from_crm(i.source);
   prem := public.partner_premium_at(uid);
 
   for m in select x.ms, x.cnt from (values (3, 10), (10, 0), (20, 20)) x(ms, cnt) where n >= x.ms loop
@@ -480,17 +483,17 @@ begin
   with c as (
     select (i.created_at at time zone 'Asia/Kolkata')::date as day, row_number() over (order by i.created_at) as k
       from public.partner_listings pl join public.inventory i on i.property_id = pl.property_id
-     where pl.broker_id = uid and public.partner_flat_complete(i))
+     where pl.broker_id = uid and public.partner_flat_complete(i) and not public.inventory_from_crm(i.source))
   select day into day1 from c where k = 3;
   select count(*) into today_n
     from public.partner_listings pl join public.inventory i on i.property_id = pl.property_id
-   where pl.broker_id = uid and public.partner_flat_complete(i) and (i.created_at at time zone 'Asia/Kolkata')::date = today;
+   where pl.broker_id = uid and public.partner_flat_complete(i) and not public.inventory_from_crm(i.source) and (i.created_at at time zone 'Asia/Kolkata')::date = today;
   if day1 is not null then
     d := case when today_n >= 5 or today = day1 then today else today - 1 end;
     loop
       exit when d < day1;
       exit when d <> day1 and (select count(*) from public.partner_listings pl join public.inventory i on i.property_id = pl.property_id
-                                 where pl.broker_id = uid and public.partner_flat_complete(i)
+                                 where pl.broker_id = uid and public.partner_flat_complete(i) and not public.inventory_from_crm(i.source)
                                    and (i.created_at at time zone 'Asia/Kolkata')::date = d) < 5;
       days := days + 1;
       d := d - 1;
