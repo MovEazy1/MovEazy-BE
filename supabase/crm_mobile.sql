@@ -78,6 +78,9 @@ begin
          where coalesce(i.status, '') not in ('rented', 'paused')
            -- not staff or a partner liking flats themselves
            and (l.user_id is null or not exists (select 1 from public.broker_partners b where b.user_id = l.user_id))
+           -- nor a client we've closed (closed by us or elsewhere)
+           and coalesce(c.status, '') not in ('closed_by_us', 'closed_outside')
+           and not exists (select 1 from public.crm_clients cx where cx.id = l.client_id and cx.status in ('closed_by_us', 'closed_outside'))
            -- no visit asked for or fixed, by anyone
            and not exists (select 1 from public.visit_bookings v
                             where v.user_id = l.user_id and v.property_id = l.property_id and coalesce(v.status, '') <> 'cancelled')
@@ -134,6 +137,7 @@ begin
         join public.partner_lead_requests q on q.id = a.request_id
         left join public.broker_partners b on b.user_id = a.broker_id
        where a.status = 'assigned' and a.assigned_at < now() - interval '24 hours'
+         and c.status not in ('closed_by_us', 'closed_outside')
          and not exists (select 1 from public.partner_lead_reachouts x where x.assignment_id = a.id)
     ), '[]'::jsonb)
   );
