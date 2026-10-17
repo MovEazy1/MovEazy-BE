@@ -1,6 +1,7 @@
 -- A partner edits their flat (MovEazy-FE pages/partners/AddProperty.jsx in
 -- edit mode, "Modify details" on the flat's page).
 --
+--   partner_listing_for_edit(property): the flat's editable fields, for the form.
 --   partner_listing_update(property, patch): any flat that is theirs —
 --   posted by them, or given to them (partner_listings, e.g. the flats
 --   MovEazy uploaded from the CRM for them). Only the flat's own fields can
@@ -62,7 +63,32 @@ begin
 end;
 $$;
 
+/** Everything the edit screen shows for one of their flats. */
+create or replace function public.partner_listing_for_edit(p_property text)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is null or not public.owns_listing(p_property, auth.uid()) then
+    raise exception 'Not your flat.' using errcode = '42501';
+  end if;
+  return (select jsonb_build_object(
+            'property_id', i.property_id, 'status', i.status, 'flat_type', i.flat_type, 'property_type', i.property_type,
+            'bedrooms', i.bedrooms, 'rent', i.rent, 'deposit', i.deposit, 'maintenance', i.maintenance, 'furnishing', i.furnishing,
+            'area', i.area, 'nearby_areas', i.nearby_areas, 'latitude', i.latitude, 'longitude', i.longitude,
+            'occupants_allowed', i.occupants_allowed, 'amenities', i.amenities, 'available_from', i.available_from,
+            'floor_number', i.floor_number, 'title', i.title, 'description', i.description,
+            'images', i.images, 'cover_image_url', i.cover_image_url)
+            from public.inventory i where i.property_id = p_property);
+end;
+$$;
+
 revoke all on function public.partner_listing_update(text, jsonb) from public, anon;
 grant execute on function public.partner_listing_update(text, jsonb) to authenticated;
+revoke all on function public.partner_listing_for_edit(text) from public, anon;
+grant execute on function public.partner_listing_for_edit(text) to authenticated;
 
 commit;
