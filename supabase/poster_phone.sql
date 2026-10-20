@@ -1,5 +1,5 @@
 -- The phone number printed on the red To-Let poster (MovEazy-FE
--- lib/qrPoster.js "tolet-a1", components/QrPosterBlock.jsx).
+-- lib/qrPoster.js "redtolet", components/QrPosterBlock.jsx).
 --
 -- It isn't the owner's number: whoever makes the poster sets it — the MovEazy
 -- team in the CRM, or the owner in the owner app — on a building, or on one
