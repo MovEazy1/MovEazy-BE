@@ -1,15 +1,18 @@
--- The phone number printed on the red To-Let poster (MovEazy-FE
--- lib/qrPoster.js "redtolet", components/QrPosterBlock.jsx).
+-- The two phone numbers printed on the red To-Let poster (MovEazy-FE
+-- lib/qrPoster.js "redtolet", components/QrPosterBlock.jsx), one per line.
 --
--- It isn't the owner's number: whoever makes the poster sets it — the MovEazy
--- team in the CRM, or the owner in the owner app — on a building, or on one
--- flat. A flat's poster uses the flat's own number, else its building's.
+-- They aren't the owner's numbers: whoever makes the poster sets them — the
+-- MovEazy team in the CRM, or the owner in the owner app. A building's poster
+-- and each flat's poster have their own pair; nothing carries over from one
+-- to the other.
 --
---   poster_phone_get(property, building)   the saved numbers, for the form.
---   poster_phone_set(property, building, phone)
---                                          save one (on the flat when a
---                                          property is given, else on the
---                                          building); '' clears it.
+--   poster_phone_get(property, building)   { phone, phone2 }: the saved pair,
+--                                          the flat's when a property is
+--                                          given, else the building's.
+--   poster_phone_set(property, building, phone, phone2)
+--                                          save the pair — both ten digits
+--                                          (a leading +91 or 0 is dropped),
+--                                          or both '' to clear.
 --
 -- Who may: CRM staff read, crm.properties.write saves; an approved owner reads
 -- and saves their own flats and buildings. The columns aren't granted to
@@ -20,9 +23,11 @@
 begin;
 
 alter table public.owner_buildings add column if not exists poster_phone text not null default '';
+alter table public.owner_buildings add column if not exists poster_phone2 text not null default '';
 alter table public.inventory add column if not exists poster_phone text not null default '';
+alter table public.inventory add column if not exists poster_phone2 text not null default '';
 
-/** May the caller see or set this flat's / building's poster number? `write` asks for saving. */
+/** May the caller see or set this flat's / building's poster numbers? `write` asks for saving. */
 create or replace function public.poster_phone_allowed(p_property text, p_building uuid, write boolean)
 returns boolean
 language sql
@@ -38,7 +43,25 @@ as $$
 $$;
 revoke all on function public.poster_phone_allowed(text, uuid, boolean) from public, anon, authenticated;
 
-/** { flat, building }: the flat's own number and its building's (or the building's alone). */
+/** "+91 98765 43210" → "9876543210"; null when it isn't ten digits. '' stays ''. */
+create or replace function public.poster_phone_clean(p text)
+returns text
+language plpgsql
+immutable
+set search_path = public
+as $$
+declare
+  d text := regexp_replace(coalesce(p, ''), '\D', '', 'g');
+begin
+  if length(d) = 12 and d like '91%' then d := substr(d, 3);
+  elsif length(d) = 11 and d like '0%' then d := substr(d, 2);
+  end if;
+  return case when d = '' or d ~ '^[0-9]{10}$' then d end;
+end;
+$$;
+revoke all on function public.poster_phone_clean(text) from public, anon, authenticated;
+
+/** { phone, phone2 }: the flat's pair, or the building's. */
 create or replace function public.poster_phone_get(p_property text default null, p_building uuid default null)
 returns jsonb
 language plpgsql
@@ -48,55 +71,52 @@ set search_path = public
 as $$
 declare
   pid text := nullif(upper(trim(coalesce(p_property, ''))), '');
-  bid uuid := p_building;
 begin
-  if pid is null and bid is null then raise exception 'Which flat or building?' using errcode = '22023'; end if;
-  if not public.poster_phone_allowed(pid, case when pid is null then bid end, false) then
-    raise exception 'Not your flat.' using errcode = '42501';
+  if pid is null and p_building is null then raise exception 'Which flat or building?' using errcode = '22023'; end if;
+  if not public.poster_phone_allowed(pid, case when pid is null then p_building end, false) then
+    raise exception 'Not yours.' using errcode = '42501';
   end if;
   if pid is not null then
-    select i.building_id into bid from public.inventory i where i.property_id = pid;
+    return (select jsonb_build_object('phone', i.poster_phone, 'phone2', i.poster_phone2) from public.inventory i where i.property_id = pid);
   end if;
-  return jsonb_build_object(
-    'flat', case when pid is null then null else (select i.poster_phone from public.inventory i where i.property_id = pid) end,
-    'building', (select b.poster_phone from public.owner_buildings b where b.id = bid));
+  return (select jsonb_build_object('phone', b.poster_phone, 'phone2', b.poster_phone2) from public.owner_buildings b where b.id = p_building);
 end;
 $$;
 
-/** Save the poster number: ten digits (a leading +91 or 0 is dropped), or '' to clear. Returns what was saved. */
-create or replace function public.poster_phone_set(p_property text default null, p_building uuid default null, p_phone text default '')
-returns text
+-- The one-number version this replaces.
+drop function if exists public.poster_phone_set(text, uuid, text);
+
+/** Save the pair: both ten digits, or both '' to clear. Returns { phone, phone2 } as saved. */
+create or replace function public.poster_phone_set(p_property text default null, p_building uuid default null, p_phone text default '', p_phone2 text default '')
+returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
   pid text := nullif(upper(trim(coalesce(p_property, ''))), '');
-  d   text := regexp_replace(coalesce(p_phone, ''), '\D', '', 'g');
+  a   text := public.poster_phone_clean(p_phone);
+  b   text := public.poster_phone_clean(p_phone2);
 begin
   if pid is null and p_building is null then raise exception 'Which flat or building?' using errcode = '22023'; end if;
   if not public.poster_phone_allowed(pid, case when pid is null then p_building end, true) then
-    raise exception 'Not your flat.' using errcode = '42501';
+    raise exception 'Not yours.' using errcode = '42501';
   end if;
-  if length(d) = 12 and d like '91%' then d := substr(d, 3);
-  elsif length(d) = 11 and d like '0%' then d := substr(d, 2);
-  end if;
-  if d <> '' and d !~ '^[0-9]{10}$' then
-    raise exception 'Enter a 10-digit phone number.' using errcode = '22023';
-  end if;
+  if a is null or b is null then raise exception 'Enter 10-digit phone numbers.' using errcode = '22023'; end if;
+  if (a = '') <> (b = '') then raise exception 'Enter both phone numbers.' using errcode = '22023'; end if;
   if pid is not null then
-    update public.inventory set poster_phone = d where property_id = pid;
+    update public.inventory set poster_phone = a, poster_phone2 = b where property_id = pid;
   else
-    update public.owner_buildings set poster_phone = d where id = p_building;
+    update public.owner_buildings set poster_phone = a, poster_phone2 = b where id = p_building;
   end if;
   if not found then raise exception 'Not found.' using errcode = '22023'; end if;
-  return d;
+  return jsonb_build_object('phone', a, 'phone2', b);
 end;
 $$;
 
 revoke all on function public.poster_phone_get(text, uuid) from public, anon;
 grant execute on function public.poster_phone_get(text, uuid) to authenticated;
-revoke all on function public.poster_phone_set(text, uuid, text) from public, anon;
-grant execute on function public.poster_phone_set(text, uuid, text) to authenticated;
+revoke all on function public.poster_phone_set(text, uuid, text, text) from public, anon;
+grant execute on function public.poster_phone_set(text, uuid, text, text) to authenticated;
 
 commit;
