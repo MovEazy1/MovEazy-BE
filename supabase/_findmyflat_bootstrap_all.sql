@@ -285,14 +285,11 @@ create policy "users manage own requirement"
   using (user_id = auth.uid() or public.is_admin_allowlisted())
   with check (user_id = auth.uid());
 
--- Posters need to read every requirement to find who their new flat matches
--- (fe/src/pages/ListMyFlat.jsx success screen). Requirements are non-sensitive
--- preference data, not contact details, so authenticated read-all is acceptable.
+-- No read-all: rows carry email and WhatsApp. List my Flat's "who does this
+-- match" reads requirements_for_matching() (preferences, no contact) and the
+-- CRM staff read through "crm staff read requirements" —
+-- user_requirements_privacy.sql.
 drop policy if exists "authenticated read requirements for matching" on public.user_requirements;
-create policy "authenticated read requirements for matching"
-  on public.user_requirements for select
-  to authenticated
-  using (true);
 
 grant usage on schema public to anon, authenticated;
 grant select, insert, update, delete on public.user_requirements to authenticated;
