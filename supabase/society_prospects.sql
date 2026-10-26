@@ -286,7 +286,7 @@ begin
   end if;
 
   for r in select * from jsonb_array_elements(p_rows) loop
-    continue when coalesce(r ->> 'place_id', '') !~ '^[A-Za-z0-9_-]{10,300}$' or length(trim(coalesce(r ->> 'name', ''))) < 2;
+    continue when coalesce(r ->> 'place_id', '') !~ '^[A-Za-z0-9_-]+$' or length(r ->> 'place_id') not between 10 and 300 or length(trim(coalesce(r ->> 'name', ''))) < 2;
     select id into pid from public.society_prospects where place_id = r ->> 'place_id';
     isnew := pid is null;
     if isnew then
