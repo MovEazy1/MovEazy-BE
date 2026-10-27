@@ -26,6 +26,7 @@ const fn = (src, name) => {
   return src.slice(i, src.indexOf("$$;", body + 5) + 3);
 };
 const SQL = read("owner_qr_overview.sql");
+const DESK = read("building_call_desk.sql");
 
 let passed = true;
 const check = (ok, why, extra = "") => {
@@ -60,7 +61,8 @@ create table public.inventory (property_id text primary key, status text default
 insert into public.inventory values ('P1'), ('P2'), ('PX');
 create table public.owner_property_links (owner_id uuid, property_id text, linked_at timestamptz default now());
 insert into public.owner_property_links values ('${OWNER}', 'P1'), ('${OWNER}', 'P2'), ('${OTHER}', 'PX');
-create table public.owner_buildings (id uuid primary key, owner_id uuid, broker_id uuid, name text, code text);
+create table public.owner_buildings (id uuid primary key, owner_id uuid, broker_id uuid, name text, code text,
+  status text default 'active', updated_at timestamptz default now());
 insert into public.owner_buildings values ('${BLD}', '${OWNER}', null, 'Sunrise Residency', 'SUNRS2'), ('${BLD2}', '${OTHER}', null, 'Other Towers', 'OTHER2');
 create function public.building_by_code(p_code text) returns uuid language sql stable as $$
   select id from public.owner_buildings where code = upper(trim(p_code)) $$;
@@ -106,6 +108,10 @@ await db.exec(fn(read("partner_website_leads.sql"), "flat_view"));
 await db.exec(fn(read("owner_buildings.sql"), "building_view"));
 await db.exec(`grant select, insert, update, delete on all tables in schema public to anon, authenticated;
   grant execute on all functions in schema public to anon, authenticated;`);
+await db.exec(fn(read("lead_intake.sql"), "normalize_mobile"));
+await db.exec(`create function public.has_admin_scope(s text) returns boolean language sql stable as $$ select false $$;
+  create function public.is_crm_staff() returns boolean language sql stable as $$ select false $$;`);
+await db.exec(DESK);
 await db.exec(SQL);
 await db.exec(SQL);
 check(true, "owner_qr_overview.sql applies, and re-applies over itself");
@@ -163,6 +169,14 @@ await db.exec(`insert into public.visit_bookings (user_id, property_id) values (
   insert into public.owner_building_leads (building_id, name, phone, status) values ('${BLD}', 'Gone', '9811100000', 'cancelled');
   insert into public.owner_building_leads (building_id, name, phone) values ('${BLD2}', 'Not yours', '9811199999');`);
 
+console.log("\ncall caretaker");
+r = await as(anon, `select public.building_call_desk('SUNRS2', 'phone-asha-0001', '+91 98111 44455', 'Asha', 'contacts')`);
+check(r.error == null && one(r).caretaker.phone === "9146969162", "contacts: MovEazy's number until the building has its own", r.error?.message);
+await as(anon, `select public.building_call_desk('SUNRS2', 'phone-asha-0001', '9811144455', 'Asha', 'call', 'caretaker')`);
+await as(anon, `select public.building_call_desk('SUNRS2', 'phone-asha-0001', '9811144455', 'Asha', 'feedback', '', 'call_not_picked')`);
+await as(anon, `select public.building_call_desk('SUNRS2', 'phone-asha-0001', '9811144455', 'Asha', 'feedback', '', 'other', 'No lift?')`);
+await as(anon, `select public.building_call_desk('OTHER2', 'phone-x-000001', '9811199990', 'Elsewhere', 'contacts')`);
+
 console.log("\nthe owner's overview");
 r = await as(owner, "select public.owner_qr_overview()");
 check(r.error == null, "the owner reads it", r.error?.message);
@@ -175,7 +189,7 @@ check(byRef.P1?.scans === 6 && byRef.P2?.scans === 2 && byRef[BLD]?.scans === 3 
   "each flat and building", JSON.stringify(o.by_place));
 check(!byRef.PX && !byRef[BLD2], "nothing of another owner's");
 const list = Object.fromEntries(o.list.map((p) => [p.name, p]));
-check(o.people === 4 && o.list.length === 4, "people: Ravi, Neha, the earlier signed-in opener, the walk-in", o.list.map((p) => p.name).join(", "));
+check(o.people === 5 && o.list.length === 5, "people: Ravi, Neha, the earlier signed-in opener, the walk-in, the caller", o.list.map((p) => p.name).join(", "));
 check(o.visited === 2, "visited: Neha's booking and the walk-in's request (cancelled ones don't count)", String(o.visited));
 const rv = list["Ravi Kumar"];
 check(rv?.phone === "9845012345" && rv?.email === "ravi@x.in", "Ravi: name, mobile, email");
@@ -189,10 +203,16 @@ check(nh?.phone === "9900011122" && nh?.visit === true, "Neha: named from her em
 check(list["Walk In"]?.phone === "9811122233" && list["Walk In"]?.user_id == null, "the building walk-in: name and number");
 check(list.oldie?.places?.[0]?.ref === "P2", "the earlier signed-in opener is there too");
 check(!o.list.some((p) => p.user_id === OWNER || p.name === "Gone" || p.name === "Not yours"), "never the owner, a cancelled request or another owner's lead");
+const asha = list.Asha;
+check(asha?.phone === "9811144455" && asha?.visit === false, "Call Caretaker: the tenant is there, with their number", JSON.stringify(asha));
+check(JSON.stringify(asha?.places?.[0]?.called) === '["caretaker"]' && asha?.places?.[0]?.ref === BLD, "who they called, at which building");
+check(asha?.feedback?.length === 2 && asha.feedback.some((f) => f.kind === "other" && f.note === "No lift?") && asha.feedback.some((f) => f.kind === "call_not_picked"),
+  "and what they said after", JSON.stringify(asha?.feedback));
+check(!list.Elsewhere, "not another owner's building's callers");
 
 console.log("\nwho can read it");
 const ot = one(await as(other, "select public.owner_qr_overview()"));
-check(ot.scans === 1 && ot.list.length === 1 && ot.list[0].name === "Not yours" && ot.by_place.every((p) => p.ref === "PX" || p.ref === BLD2), "another owner: only their own", JSON.stringify(ot));
+check(ot.scans === 1 && ot.list.length === 2 && ot.list.some((p) => p.name === "Not yours") && ot.by_place.every((p) => p.ref === "PX" || p.ref === BLD2), "another owner: only their own", JSON.stringify(ot));
 check(one(await as(ravi, "select public.owner_qr_overview()")) == null, "a renter: nothing");
 r = await as(anon, "select public.owner_qr_overview()");
 check(Boolean(r.error), "anon: refused");

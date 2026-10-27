@@ -3,7 +3,8 @@
 -- (fe/src/pages/owners/OwnerHome.jsx, fe/src/pages/owners/QrScans.jsx).
 --
 -- Run in the Supabase SQL editor AFTER flat_insights.sql, owner_buildings.sql,
--- partner_website_leads.sql and tenant_profile_schema.sql. Safe to re-run.
+-- partner_website_leads.sql, tenant_profile_schema.sql and building_call_desk.sql.
+-- Safe to re-run.
 --
 -- Every open counts. flat_scans and owner_building_scans keep their one row
 -- per visitor per page a day (every "people" number reads that), and now also
@@ -13,9 +14,10 @@
 --
 -- The owner sees, across their flats and buildings:
 --   scans    every open of the pages, from the QR or a shared link;
---   people   everyone who opened one signed in, booked a visit to a flat or
---            asked to visit a building — name, mobile, tenant profile, and
---            which page and when;
+--   people   everyone who opened one signed in, booked a visit to a flat,
+--            asked to visit a building, or asked a building's QR page for
+--            its caretaker's number — name, mobile, tenant profile, which
+--            page and when, who they called and what they said after;
 --   visited  those of them who booked or asked for a visit.
 -- ─────────────────────────────────────────────────────────────────────────────
 
@@ -132,7 +134,8 @@ $$;
  *   { scans, week, people, visited,
  *     by_place: [{ kind: flat|building, ref, name, scans, week, people }],
  *     list: [{ key, user_id, name, phone, email, at, visit, profile,
- *              places: [{ kind, ref, at, hits, visit }] }] }
+ *              places: [{ kind, ref, at, hits, visit, called: [caretaker|manager] }],
+ *              feedback: [{ kind, note, at, ref }] }] }
  * null for anyone who isn't an approved owner.
  */
 create or replace function public.owner_qr_overview()
@@ -153,26 +156,33 @@ as $$
     select 'building', s.building_id::text, s.day, s.hits, s.last_at, s.user_id
       from public.owner_building_scans s join blds b on b.id = s.building_id),
   touches as (
-    select s.user_id, null::text as phone, null::text as name, s.kind, s.ref, s.last_at as at, s.hits, false as visit
+    select s.user_id, null::text as phone, null::text as name, s.kind, s.ref, s.last_at as at, s.hits, false as visit,
+           null::text as called, null::text as fb, null::text as note
       from scans s where s.user_id is not null
     union all
-    select v.user_id, null, null, 'flat', v.property_id, v.created_at, 0, true
+    select v.user_id, null, null, 'flat', v.property_id, v.created_at, 0, true, null, null, null
       from public.visit_bookings v join flats f on f.property_id = v.property_id
      where coalesce(v.status, '') not ilike 'cancel%'
     union all
-    select bl.user_id, bl.phone, bl.name, 'building', bl.building_id::text, bl.created_at, 0, true
+    select bl.user_id, bl.phone, bl.name, 'building', bl.building_id::text, bl.created_at, 0, true, null, null, null
       from public.owner_building_leads bl join blds b on b.id = bl.building_id
-     where bl.status <> 'cancelled'),
+     where bl.status <> 'cancelled'
+    union all
+    -- Call Caretaker on the building's QR page (building_call_desk.sql).
+    select e.user_id, e.phone, nullif(e.name, ''), 'building', e.building_id::text, e.created_at, 0, false,
+           nullif(e.target, ''), nullif(e.feedback, ''), nullif(e.note, '')
+      from public.building_call_events e join blds b on b.id = e.building_id),
   t as (
     select x.*, coalesce(x.user_id::text, 'tel:' || x.phone) as who
       from touches x, me
      where x.user_id is distinct from me.uid and (x.user_id is not null or x.phone is not null)),
   places as (
-    select who, kind, ref, max(at) as at, sum(hits)::int as hits, bool_or(visit) as visit
+    select who, kind, ref, max(at) as at, sum(hits)::int as hits, bool_or(visit) as visit,
+           coalesce(array_agg(distinct called) filter (where called is not null), '{}') as called
       from t group by who, kind, ref),
   people as (
     select p.who, max(p.at) as at, bool_or(p.visit) as visit,
-           jsonb_agg(jsonb_build_object('kind', p.kind, 'ref', p.ref, 'at', p.at, 'hits', p.hits, 'visit', p.visit)
+           jsonb_agg(jsonb_build_object('kind', p.kind, 'ref', p.ref, 'at', p.at, 'hits', p.hits, 'visit', p.visit, 'called', p.called)
                      order by p.at desc) as places
       from places p group by p.who)
   select case when exists (select 1 from me) then jsonb_build_object(
@@ -199,6 +209,8 @@ as $$
       select coalesce(jsonb_agg(row order by row ->> 'at' desc), '[]'::jsonb) from (
         select jsonb_build_object(
                  'key', pe.who, 'user_id', u.id, 'at', pe.at, 'visit', pe.visit, 'places', pe.places,
+                 'feedback', coalesce((select jsonb_agg(jsonb_build_object('kind', t.fb, 'note', t.note, 'at', t.at, 'ref', t.ref) order by t.at desc)
+                                        from t where t.who = pe.who and t.fb is not null), '[]'::jsonb),
                  'name', coalesce(nullif(trim(up.name), ''),
                                   (select t.name from t where t.who = pe.who and coalesce(t.name, '') <> '' order by t.at desc limit 1),
                                   split_part(coalesce(up.email, u.email, ''), '@', 1), ''),
