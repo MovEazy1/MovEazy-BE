@@ -10,7 +10,10 @@
  *   - each number is a CRM client (found by number, else new), and every save
  *     is on the client's history;
  *   - "Paid token" books the card's flats, and moving off it frees them;
- *   - CRM staff read; only client writers save; anon and tenants can't.
+ *   - CRM staff read; only client writers save; anon and tenants can't;
+ *   - a follow-up day on a card; the tenants page merges the team's cards with
+ *     the QR page's callers (building_tenants_board.sql); the CRM home's bar
+ *     counts tenants and follow-ups due; the building's owner reads the same.
  */
 import { PGlite } from "@electric-sql/pglite";
 import { readFileSync } from "node:fs";
@@ -25,6 +28,8 @@ const fn = (src, name) => {
   return src.slice(i, src.indexOf("$$;", src.indexOf("as $$", i) + 5) + 3);
 };
 const SQL = read("building_tenant_tracks.sql");
+const DESK = read("building_call_desk.sql");
+const BOARD = read("building_tenants_board.sql");
 let passed = true;
 const check = (ok, why, extra = "") => {
   console.log(`  ${ok ? "ok    " : "FAIL  "} ${why}${ok || !extra ? "" : ` — ${extra}`}`);
@@ -32,15 +37,25 @@ const check = (ok, why, extra = "") => {
 };
 const BR = "d0000000-0000-0000-0000-000000000001";
 const OTHER = "d0000000-0000-0000-0000-000000000002";
+const OWNER = "a0000000-0000-0000-0000-000000000001";
+const OTHER_OWNER = "a0000000-0000-0000-0000-000000000002";
 const db = new PGlite();
 await db.exec(`
 create role anon; create role authenticated;
 create schema auth;
+create table auth.users (id uuid primary key);
+create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('test.uid', true), '')::uuid $$;
 create function auth.jwt() returns jsonb language sql stable as $$ select jsonb_build_object('email', current_setting('test.email', true)) $$;
 create function public.is_crm_staff() returns boolean language sql stable as $$ select current_setting('test.staff', true) = 'on' $$;
 create function public.has_admin_scope(s text) returns boolean language sql stable as $$ select current_setting('test.write', true) = 'on' $$;
-create table public.owner_buildings (id uuid primary key, code text, name text);
-insert into public.owner_buildings values ('${BR}', 'H33PSH', 'BR Homes'), ('${OTHER}', 'OTHER2', 'Other Towers');
+create table public.owner_buildings (id uuid primary key, code text, name text, owner_id uuid, status text default 'active', updated_at timestamptz default now());
+insert into public.owner_buildings (id, code, name, owner_id) values ('${BR}', 'H33PSH', 'BR Homes', '${OWNER}'), ('${OTHER}', 'OTHER2', 'Other Towers', null);
+create function public.building_by_code(p_code text) returns uuid language sql stable security definer as $$
+  select b.id from public.owner_buildings b where b.code = upper(trim(coalesce(p_code, ''))) and b.status = 'active' $$;
+create table public.owner_accounts (user_id uuid primary key, status text);
+insert into public.owner_accounts values ('${OWNER}', 'approved'), ('${OTHER_OWNER}', 'approved');
+create function public.is_approved_owner() returns boolean language sql stable security definer as $$
+  select exists (select 1 from public.owner_accounts where user_id = auth.uid() and status = 'approved') $$;
 create table public.inventory (property_id text primary key, building_id uuid, unit_no text default '', unit_order int);
 insert into public.inventory values ('MZ-504', '${BR}', '504', 2), ('MZ-509', '${BR}', '509', 3), ('MZ-X', '${OTHER}', '101', 1);
 create table public.owner_building_bookings (property_id text primary key, building_id uuid, booked_by text default '', booked_at timestamptz default now());
@@ -52,12 +67,15 @@ create table public.crm_activities (id uuid primary key default gen_random_uuid(
   actor_email text default '', type text, body text, meta jsonb, created_at timestamptz default now());
 `);
 await db.exec(fn(read("lead_intake.sql"), "normalize_mobile"));
+await db.exec(DESK);
 await db.exec(SQL);
 await db.exec(SQL);
+await db.exec(BOARD);
+await db.exec(BOARD);
 check(true, "building_tenant_tracks.sql applies, and re-applies over itself");
 
 async function as(who, sql, params = []) {
-  await db.exec(`reset role; select set_config('test.staff', '${who.staff ? "on" : ""}', false), set_config('test.write', '${who.write ? "on" : ""}', false),
+  await db.exec(`reset role; select set_config('test.uid', '${who.uid ?? ""}', false), set_config('test.staff', '${who.staff ? "on" : ""}', false), set_config('test.write', '${who.write ? "on" : ""}', false),
     set_config('test.email', '${who.email ?? ""}', false); set role ${who.role ?? "authenticated"};`);
   try { return { rows: (await db.query(sql, params)).rows, error: null }; }
   catch (e) { return { rows: null, error: e }; }
@@ -129,6 +147,36 @@ check(Boolean((await save(BR, { phone: "9811122222" }, viewer)).error), "staff w
 check(Boolean((await as(anon, `select public.crm_tenant_tracks('${BR}')`)).error), "anon can't read");
 check(Boolean((await as(tenant, `select public.crm_tenant_tracks('${BR}')`)).error), "a tenant can't either");
 check(Boolean((await as(anon, "select * from public.building_tenant_tracks")).error), "the table itself is closed");
+
+console.log("\nfollow-up and the tenants page");
+r = await save(BR, { phone: "9876543210", visit: "done", liked: "liked", liked_status: "will_pay_token", property_ids: ["MZ-504"], follow_up_on: "2000-01-01" });
+check(one(r).follow_up_on === "2000-01-01", "a follow-up day on the card", JSON.stringify(one(r)?.follow_up_on));
+r = await save(BR, { phone: "9811100000", visit: "done", liked: "disliked", reasons: ["location"], follow_up_on: "soon" });
+check(one(r).follow_up_on == null, "a bad day is no day");
+await as(anon, `select public.building_call_desk('H33PSH', 'browser-q1', '9822200000', 'From QR', 'contacts')`);
+await as(anon, `select public.building_call_desk('H33PSH', 'browser-q1', '9822200000', 'From QR', 'call', 'caretaker')`);
+await as(anon, `select public.building_call_desk('H33PSH', 'browser-q1', '9822200000', 'From QR', 'feedback', '', 'call_not_picked')`);
+await as(anon, `select public.building_call_desk('H33PSH', 'browser-q2', '9876543210', '', 'contacts')`);
+await as(anon, `select public.building_call_desk('OTHER2', 'browser-q3', '9833300000', 'Elsewhere', 'contacts')`);
+r = await as(viewer, `select public.crm_building_tenants('${BR}')`);
+const board = one(r);
+const byPhone = Object.fromEntries((board?.tenants ?? []).map((t) => [t.phone, t]));
+check(r.error == null && board.building.name === "BR Homes" && board.building.enabled === true && board.flats.length === 2, "the CRM's tenants page", r.error?.message);
+check(Object.keys(byPhone).length === 4 && !byPhone["9833300000"], "the team's cards and the QR's callers, this building only", Object.keys(byPhone).join(","));
+const q = byPhone["9822200000"];
+check(q.track == null && q.name === "From QR" && q.qr.asked === 1 && JSON.stringify(q.qr.called) === '["caretaker"]' && q.qr.feedback[0].kind === "call_not_picked",
+  "a QR caller: no card yet, what they did", JSON.stringify(q));
+const both = byPhone["9876543210"];
+check(both.track?.liked_status === "will_pay_token" && both.qr?.asked === 1 && both.name === "Ravi", "a tenant in both: one row, the card and the QR", JSON.stringify(both));
+r = await as(viewer, "select public.crm_tracked_buildings()");
+const bars = one(r);
+check(bars.length === 1 && bars[0].name === "BR Homes" && bars[0].tenants === 4 && bars[0].due === 1, "the home bar: BR Homes, 4 tenants, 1 follow-up due", JSON.stringify(bars));
+r = await as({ uid: OWNER }, `select public.owner_building_tenants('${BR}')`);
+check(r.error == null && one(r)?.tenants?.length === 4, "the building's owner sees the same list", r.error?.message);
+check(one(await as({ uid: OTHER_OWNER }, `select public.owner_building_tenants('${BR}')`)) == null, "another owner sees nothing");
+check(Boolean((await as(anon, `select public.crm_building_tenants('${BR}')`)).error), "anon can't read the page");
+check(Boolean((await as(tenant, "select public.crm_tracked_buildings()")).error), "nor a tenant the bar");
+check(Boolean((await as(viewer, `select public.building_tenants_board('${BR}')`)).error), "the board itself isn't callable");
 
 console.log(passed ? "\nALL CHECKS PASSED" : "\nSOME CHECKS FAILED");
 process.exit(passed ? 0 : 1);

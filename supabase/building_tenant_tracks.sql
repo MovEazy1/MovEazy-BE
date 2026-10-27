@@ -17,6 +17,7 @@
 -- history. "Paid token" books the flats picked on the card (the QR page then
 -- shows them taken); moving off it frees what it booked.
 -- Only buildings with tenant_tracker on show the bar — BR Homes for now.
+-- A card can carry the day to follow up with the tenant (follow_up_on).
 -- ─────────────────────────────────────────────────────────────────────────────
 
 begin;
@@ -42,6 +43,7 @@ create table if not exists public.building_tenant_tracks (
   unique (building_id, phone)
 );
 create index if not exists building_tenant_tracks_building_idx on public.building_tenant_tracks (building_id, updated_at desc);
+alter table public.building_tenant_tracks add column if not exists follow_up_on date;
 
 create table if not exists public.tenant_reason_options (
   id         uuid primary key default gen_random_uuid(),
@@ -71,7 +73,7 @@ returns jsonb language sql stable security definer set search_path = public as $
   select jsonb_build_object(
     'id', t.id, 'phone', t.phone, 'name', t.name, 'property_ids', t.property_ids, 'note', t.note,
     'visit', t.visit, 'liked', t.liked, 'liked_status', t.liked_status, 'reasons', t.reasons,
-    'client_id', t.client_id, 'created_by', t.created_by, 'updated_by', t.updated_by,
+    'client_id', t.client_id, 'follow_up_on', t.follow_up_on, 'created_by', t.created_by, 'updated_by', t.updated_by,
     'created_at', t.created_at, 'updated_at', t.updated_at,
     'flats', (select coalesce(jsonb_agg(coalesce(nullif(i.unit_no, ''), i.property_id) order by i.unit_order nulls last, i.unit_no), '[]'::jsonb)
                 from public.inventory i where i.property_id = any(t.property_ids)))
@@ -101,7 +103,7 @@ $$;
 
 /**
  * Add a tenant, or update their card (same building, same mobile):
- * { phone, name, property_ids, note, visit, liked, liked_status, reasons }.
+ * { phone, name, property_ids, note, visit, liked, liked_status, reasons, follow_up_on }.
  * A reason that isn't built in is a typed one, offered everywhere from now on.
  * → the card.
  */
@@ -126,6 +128,7 @@ declare
   cid    uuid;
   bname  text;
   marker text;
+  fu     date := case when coalesce(p ->> 'follow_up_on', '') ~ '^\d{4}-\d{2}-\d{2}$' then (p ->> 'follow_up_on')::date end;
 begin
   if not public.has_admin_scope('crm.clients.write') then
     raise exception 'Needs permission to update clients.' using errcode = '42501';
@@ -178,12 +181,13 @@ begin
   end if;
 
   insert into public.building_tenant_tracks as x
-    (building_id, phone, name, property_ids, note, visit, liked, liked_status, reasons, client_id, created_by, updated_by)
-  values (p_building, ph, nm, flats, left(trim(coalesce(p ->> 'note', '')), 1000), vis, lk, ls, rs, cid, me, me)
+    (building_id, phone, name, property_ids, note, visit, liked, liked_status, reasons, follow_up_on, client_id, created_by, updated_by)
+  values (p_building, ph, nm, flats, left(trim(coalesce(p ->> 'note', '')), 1000), vis, lk, ls, rs, fu, cid, me, me)
   on conflict (building_id, phone) do update set
     name = case when excluded.name <> '' then excluded.name else x.name end,
     property_ids = excluded.property_ids, note = excluded.note, visit = excluded.visit, liked = excluded.liked,
-    liked_status = excluded.liked_status, reasons = excluded.reasons, client_id = coalesce(x.client_id, excluded.client_id),
+    liked_status = excluded.liked_status, reasons = excluded.reasons, follow_up_on = excluded.follow_up_on,
+    client_id = coalesce(x.client_id, excluded.client_id),
     updated_by = me, updated_at = now()
   returning * into t;
 
@@ -208,6 +212,7 @@ begin
               || case when cardinality(t.reasons) > 0 then ' · ' || array_to_string(t.reasons, ', ') else '' end
               || case when cardinality(t.property_ids) > 0 then ' · flats ' || (select string_agg(coalesce(nullif(i.unit_no, ''), i.property_id), ', ')
                                                                             from public.inventory i where i.property_id = any(t.property_ids)) else '' end
+              || case when t.follow_up_on is not null then ' · follow up ' || to_char(t.follow_up_on, 'DD Mon') else '' end
               || case when t.note <> '' then ' — ' || t.note else '' end,
             jsonb_build_object('building_id', p_building, 'track_id', t.id, 'visit', t.visit, 'liked', t.liked,
                                'liked_status', t.liked_status, 'reasons', t.reasons, 'property_ids', t.property_ids));
