@@ -3,8 +3,8 @@
 -- (fe/src/pages/owners/OwnerHome.jsx, fe/src/pages/owners/QrScans.jsx).
 --
 -- Run in the Supabase SQL editor AFTER flat_insights.sql, owner_buildings.sql,
--- partner_website_leads.sql, tenant_profile_schema.sql and building_call_desk.sql.
--- Safe to re-run.
+-- partner_website_leads.sql, tenant_profile_schema.sql, building_call_desk.sql and
+-- building_tenant_tracks.sql. Safe to re-run.
 --
 -- Every open counts. flat_scans and owner_building_scans keep their one row
 -- per visitor per page a day (every "people" number reads that), and now also
@@ -17,7 +17,8 @@
 --   people   everyone who opened one signed in, booked a visit to a flat,
 --            asked to visit a building, or asked a building's QR page for
 --            its caretaker's number — name, mobile, tenant profile, which
---            page and when, who they called and what they said after;
+--            page and when, who they called and what they said after, and
+--            where the MovEazy team has them (building_tenant_tracks.sql);
 --   visited  those of them who booked or asked for a visit.
 -- ─────────────────────────────────────────────────────────────────────────────
 
@@ -135,7 +136,8 @@ $$;
  *     by_place: [{ kind: flat|building, ref, name, scans, week, people }],
  *     list: [{ key, user_id, name, phone, email, at, visit, profile,
  *              places: [{ kind, ref, at, hits, visit, called: [caretaker|manager] }],
- *              feedback: [{ kind, note, at, ref }] }] }
+ *              feedback: [{ kind, note, at, ref }],
+ *              status: { visit, liked, liked_status, reasons, at } | null }] }
  * null for anyone who isn't an approved owner.
  */
 create or replace function public.owner_qr_overview()
@@ -157,21 +159,26 @@ as $$
       from public.owner_building_scans s join blds b on b.id = s.building_id),
   touches as (
     select s.user_id, null::text as phone, null::text as name, s.kind, s.ref, s.last_at as at, s.hits, false as visit,
-           null::text as called, null::text as fb, null::text as note
+           null::text as called, null::text as fb, null::text as note, null::uuid as trk
       from scans s where s.user_id is not null
     union all
-    select v.user_id, null, null, 'flat', v.property_id, v.created_at, 0, true, null, null, null
+    select v.user_id, null, null, 'flat', v.property_id, v.created_at, 0, true, null, null, null, null
       from public.visit_bookings v join flats f on f.property_id = v.property_id
      where coalesce(v.status, '') not ilike 'cancel%'
     union all
-    select bl.user_id, bl.phone, bl.name, 'building', bl.building_id::text, bl.created_at, 0, true, null, null, null
+    select bl.user_id, bl.phone, bl.name, 'building', bl.building_id::text, bl.created_at, 0, true, null, null, null, null
       from public.owner_building_leads bl join blds b on b.id = bl.building_id
      where bl.status <> 'cancelled'
     union all
     -- Call Caretaker on the building's QR page (building_call_desk.sql).
     select e.user_id, e.phone, nullif(e.name, ''), 'building', e.building_id::text, e.created_at, 0, false,
-           nullif(e.target, ''), nullif(e.feedback, ''), nullif(e.note, '')
-      from public.building_call_events e join blds b on b.id = e.building_id),
+           nullif(e.target, ''), nullif(e.feedback, ''), nullif(e.note, ''), null
+      from public.building_call_events e join blds b on b.id = e.building_id
+    union all
+    -- Tenants the MovEazy team brought, and where each stands (building_tenant_tracks.sql).
+    select null, k.phone, nullif(k.name, ''), 'building', k.building_id::text, k.updated_at, 0, k.visit = 'done',
+           null, null, null, k.id
+      from public.building_tenant_tracks k join blds b on b.id = k.building_id),
   t as (
     select x.*, coalesce(x.user_id::text, 'tel:' || x.phone) as who
       from touches x, me
@@ -209,6 +216,10 @@ as $$
       select coalesce(jsonb_agg(row order by row ->> 'at' desc), '[]'::jsonb) from (
         select jsonb_build_object(
                  'key', pe.who, 'user_id', u.id, 'at', pe.at, 'visit', pe.visit, 'places', pe.places,
+                 'status', (select jsonb_build_object('visit', k.visit, 'liked', k.liked, 'liked_status', k.liked_status,
+                                                       'reasons', k.reasons, 'at', k.updated_at)
+                              from public.building_tenant_tracks k
+                             where k.id = (select t.trk from t where t.who = pe.who and t.trk is not null order by t.at desc limit 1)),
                  'feedback', coalesce((select jsonb_agg(jsonb_build_object('kind', t.fb, 'note', t.note, 'at', t.at, 'ref', t.ref) order by t.at desc)
                                         from t where t.who = pe.who and t.fb is not null), '[]'::jsonb),
                  'name', coalesce(nullif(trim(up.name), ''),
