@@ -199,6 +199,8 @@ const o = one(r);
 // P1: ravi 3 + walkby 2 + shared 1 = 6; P2: oldie 1 + ravi(20 days ago) 1 = 2; building: ravi 2 + neha 1 = 3
 check(o.scans === 11, "scans: every open across flats and the building", String(o.scans));
 check(o.week === 10, "this week: all but the open 20 days ago", String(o.week));
+check(o.by_day.length === 14 && o.by_day.at(-1).scans === 9 && o.by_day.at(-4).scans === 1 && o.by_day.reduce((t, d) => t + d.scans, 0) === 10,
+  "day by day, the last 14 days: today 9, three days ago 1", JSON.stringify(o.by_day.slice(-4)));
 const byRef = Object.fromEntries(o.by_place.map((p) => [p.ref, p]));
 check(byRef.P1?.scans === 6 && byRef.P2?.scans === 2 && byRef[BLD]?.scans === 3 && byRef[BLD]?.name === "Sunrise Residency",
   "each flat and building", JSON.stringify(o.by_place));

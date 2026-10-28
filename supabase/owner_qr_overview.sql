@@ -132,7 +132,7 @@ $$;
 /**
  * The owner's scans and the people behind them, across their flats and
  * buildings:
- *   { scans, week, people, visited,
+ *   { scans, week, people, visited, by_day: [{ day, scans }] (the last 14 days),
  *     by_place: [{ kind: flat|building, ref, name, scans, week, people }],
  *     list: [{ key, user_id, name, phone, email, at, visit, profile,
  *              places: [{ kind, ref, at, hits, visit, called: [caretaker|manager] }],
@@ -195,6 +195,9 @@ as $$
   select case when exists (select 1 from me) then jsonb_build_object(
     'scans',   (select coalesce(sum(s.hits), 0) from scans s),
     'week',    (select coalesce(sum(s.hits), 0) from scans s, today where s.day > today.d - 7),
+    'by_day',  (select jsonb_agg(jsonb_build_object('day', g.d::date,
+                                   'scans', (select coalesce(sum(s.hits), 0) from scans s where s.day = g.d::date)) order by g.d)
+                  from today, generate_series(today.d - 13, today.d, interval '1 day') g(d)),
     'people',  (select count(*) from people),
     'visited', (select count(*) from people where visit),
     'by_place', (
