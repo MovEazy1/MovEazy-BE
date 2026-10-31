@@ -113,6 +113,8 @@ create index if not exists partner_lead_events_client_idx on public.partner_lead
 create index if not exists partner_lead_events_assignment_idx on public.partner_lead_events (assignment_id, at desc);
 
 alter table public.partner_lead_assignments add column if not exists follow_up_on date;
+-- Where a building visit request came from: its QR page, or a Meta ad page (visit_ad_pages.sql).
+alter table public.owner_building_leads add column if not exists source text not null default 'qr';
 alter table public.partner_lead_assignments add column if not exists follow_up_note text not null default '';
 
 create table if not exists public.tenant_views_meta (key text primary key, at timestamptz not null default now());
@@ -953,7 +955,8 @@ as $$
       from public.visit_bookings v join flats f on f.property_id = v.property_id
      where coalesce(v.status, '') not ilike 'cancel%'
     union all
-    select bl.user_id, bl.phone, bl.name, 'building', bl.building_id::text, bl.created_at, 0, true, null, null, null, null, null, true
+    select bl.user_id, bl.phone, bl.name, 'building', bl.building_id::text, bl.created_at, 0, true, null, null, null, null, null,
+           bl.source <> 'ad' -- booked from a Meta ad page (visit_ad_pages.sql): MovEazy's, no number
       from public.owner_building_leads bl join blds b on b.id = bl.building_id
      where bl.status <> 'cancelled'
     union all

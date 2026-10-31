@@ -103,7 +103,7 @@ create function public.website_tenant_ok(p_user uuid, p_property text) returns b
 create function public.website_lead_for_user(p_user uuid, p_property text, p_kind text, p_detail text) returns void language sql as $$ select $$;
 
 -- Before this file: an open signed in was stored under the account's id.
-insert into public.flat_scans (property_id, visitor, day, source, created_at) values ('P2', '${OLDIE}', current_date - 3, 'link', now() - interval '3 days');
+insert into public.flat_scans (property_id, visitor, day, source, created_at) values ('P2', '${OLDIE}', (now() at time zone 'Asia/Kolkata')::date - 3, 'link', now() - interval '3 days');
 `);
 await db.exec(fn(read("partner_website_leads.sql"), "flat_view"));
 await db.exec(fn(read("owner_buildings.sql"), "building_view"));
