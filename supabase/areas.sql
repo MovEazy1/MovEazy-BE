@@ -66,6 +66,16 @@ select v.name, false, 1000 + row_number() over (order by v.name) * 10, false
          order by lower(trim(i.area)), trim(i.area)) v
  where not exists (select 1 from public.areas a where lower(trim(a.name)) = lower(v.name));
 
+-- "HSR Layout" and "HSR Extension" are other names for HSR (both removed from
+-- the pickers), and 70 live flats still carry them: inside HSR, so a client
+-- who asked for HSR reaches them. Only while they have no parent or children.
+update public.areas c set parent_id = p.id
+  from public.areas p
+ where lower(p.name) = 'hsr' and p.parent_id is null
+   and lower(c.name) in ('hsr layout', 'hsr extension')
+   and c.parent_id is null
+   and not exists (select 1 from public.areas k where k.parent_id = c.id);
+
 /**
  * Add (no id) or change an area: { id?, name?, chip?, parent_id?, active? }.
  * Keys left out stay as they are. Returns the row.
