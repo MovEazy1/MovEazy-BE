@@ -115,6 +115,8 @@ create index if not exists partner_lead_events_assignment_idx on public.partner_
 alter table public.partner_lead_assignments add column if not exists follow_up_on date;
 -- Where a building visit request came from: its QR page, or a Meta ad page (visit_ad_pages.sql).
 alter table public.owner_building_leads add column if not exists source text not null default 'qr';
+-- …and a call to its caretaker: from the QR page, or from an ad page after booking (visit_ad_pages.sql).
+alter table public.building_call_events add column if not exists source text not null default 'qr';
 alter table public.partner_lead_assignments add column if not exists follow_up_note text not null default '';
 
 create table if not exists public.tenant_views_meta (key text primary key, at timestamptz not null default now());
@@ -431,7 +433,8 @@ declare
 begin
   cid := public.tenant_client_for(new.user_id, new.phone, new.name, 'building_qr');
   foreach pid in array coalesce(new.property_ids, '{}') loop
-    vid := public.tenant_view_touch(pid, cid, 'qr', new.created_at);
+    -- Booked on an ad / WhatsApp page (visit_ad_pages.sql): MovEazy's, not the owner's QR.
+    vid := public.tenant_view_touch(pid, cid, case when new.source = 'ad' then 'ad' else 'qr' end, new.created_at);
     if vid is not null and new.visit_at is not null then
       perform public.tenant_view_respond(vid, 'tenant', 'visit', null, '{"visit": "pending"}'::jsonb, new.created_at);
     end if;
@@ -962,7 +965,8 @@ as $$
     union all
     -- Call Caretaker on the building's QR page (building_call_desk.sql).
     select e.user_id, e.phone, nullif(e.name, ''), 'building', e.building_id::text, e.created_at, 0, false,
-           nullif(e.target, ''), nullif(e.feedback, ''), nullif(e.note, ''), null, null, true
+           nullif(e.target, ''), nullif(e.feedback, ''), nullif(e.note, ''), null, null,
+           e.source <> 'ad' -- called after booking on an ad page: MovEazy's, no number
       from public.building_call_events e join blds b on b.id = e.building_id
     union all
     -- Tenants the MovEazy team brought, and where each stands (building_tenant_tracks.sql).
@@ -1093,7 +1097,8 @@ as $$
                      'called', coalesce(to_jsonb(array_agg(distinct e.target) filter (where e.kind = 'call')), '[]'::jsonb),
                      'feedback', coalesce(jsonb_agg(jsonb_build_object('kind', e.feedback, 'note', e.note, 'at', e.created_at) order by e.created_at desc)
                                             filter (where e.kind = 'feedback'), '[]'::jsonb),
-                     'name', (array_agg(e.name order by e.created_at desc) filter (where e.name <> ''))[1])
+                     'name', (array_agg(e.name order by e.created_at desc) filter (where e.name <> ''))[1],
+                     'source', case when bool_and(e.source = 'ad') then 'ad' else 'qr' end)
               from public.building_call_events e where e.building_id = p_building and e.phone = ph.phone
             having count(*) > 0) as qr,
            (select jsonb_agg(jsonb_build_object('property_id', v.property_id, 'unit_no', v.unit_no, 'opens', v.opens,
@@ -1109,7 +1114,8 @@ as $$
               from vw v where v.phone = ph.phone and v.response_by <> '' order by v.response_at desc limit 1) as vstatus
       from phones ph),
   shaped as (
-    select r.*, case when (r.t).id is not null then 'team' when r.qr is not null or coalesce(r.view_qr, false) then 'qr' else 'moveazy' end as via
+    select r.*, case when (r.t).id is not null then 'team'
+                     when (r.qr is not null and r.qr ->> 'source' <> 'ad') or coalesce(r.view_qr, false) then 'qr' else 'moveazy' end as via
       from rows r)
   select coalesce(jsonb_agg(x order by x ->> 'last_at' desc), '[]'::jsonb)
     from (

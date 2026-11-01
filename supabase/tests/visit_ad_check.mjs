@@ -12,7 +12,14 @@
  *   - a flat: a tenant view, visit pending, and the partner's website lead;
  *   - a building: a visit request marked 'ad' — the owner sees it without the
  *     number; the building's partner is told;
- *   - the CRM reads them and marks reminders; anon / tenants can't.
+ *   - the CRM reads them and marks reminders; anon / tenants can't;
+ *   - a building's page lists its free flats only; opens and flat taps are
+ *     kept with their source (WhatsApp / Meta), and the flats tapped go on
+ *     the visit; the phone becomes the client's;
+ *   - the call desk opens at the visit's start and closes when that day ends:
+ *     the building's caretaker and manager (MovEazy's number where unset; a
+ *     flat outside a building: MovEazy as manager), calls and feedback kept,
+ *     in the building's call log as 'ad' — the owner sees no number.
  */
 import { PGlite } from "@electric-sql/pglite";
 import { readFileSync } from "node:fs";
@@ -64,7 +71,8 @@ create table public.inventory (property_id text primary key, status text default
   unit_order int, flat_type text default '2 BHK', area text default 'HSR Layout', landmark text default 'Near BDA Complex', rent numeric default 25000,
   deposit numeric default 100000, maintenance numeric default 2000, furnishing text default 'Semi', bedrooms int default 2, bathrooms int default 2,
   area_sqft int, amenities text[] default '{}', images text[] default '{}', cover_image_url text default '', description text default '',
-  title text default '2 BHK in HSR', full_address text default '7 Hidden Lane', latitude numeric default 12.91234, longitude numeric default 77.6);
+  title text default '2 BHK in HSR', full_address text default '7 Hidden Lane', latitude numeric default 12.91234, longitude numeric default 77.6,
+  property_type text default '', available_from date, floor_number int);
 insert into public.inventory (property_id, status) values ('P1', 'published'), ('PR', 'rented');
 insert into public.inventory (property_id, building_id, unit_no, rent) values ('B1', '${BLD}', '101', 22000), ('B2', '${BLD}', '102', 26000);
 create table public.owner_property_links (owner_id uuid, property_id text);
@@ -118,6 +126,7 @@ await db.exec(read("building_tenant_tracks.sql"));
 await db.exec(read("building_tenants_board.sql"));
 await db.exec(read("owner_qr_overview.sql"));
 await db.exec(read("tenant_views.sql"));
+await db.exec(fn(read("building_flats_maintenance.sql"), "building_flats"));
 const SQL = read("visit_ad_pages.sql");
 await db.exec(SQL);
 await db.exec(SQL);
@@ -207,6 +216,59 @@ check(Boolean((await as({}, "select public.crm_ad_visits(30)")).error), "nor a t
 check(Boolean((await as(viewer, "select public.crm_ad_visit_stamp($1, 'reminder')", [b1.id])).error), "staff without write can't mark");
 check(Boolean((await as(anon, "select public.visit_ad_slot_ok('P1', now())")).error), "the internals aren't callable");
 check(Boolean((await as(anon, "select * from public.ad_visit_bookings")).error), "the table is closed");
+
+console.log("\nthe building page, what they did, the call desk");
+await db.exec(`insert into public.owner_building_bookings values ('B2', '${BLD}', 'owner')`);
+p = one(await as(anon, "select public.visit_ad_page('building', 'H33PSH')"));
+check(p.available.length === 1 && p.available[0].property_id === "B1" && p.available[0].unit_no === "101", "only free flats listed", JSON.stringify(p.available?.map((f) => f.property_id)));
+const ev = (event, extra = []) => as(anon, "select public.visit_ad_event('building', 'H33PSH', 'wa-phone-77', $1, $2, $3, $4::jsonb)", [event, ...extra]);
+await ev("open", [null, 0, JSON.stringify({ utm_source: "whatsapp" })]);
+await ev("flat_open", ["B1", 42, JSON.stringify({ utm_source: "whatsapp" })]);
+await ev("flat_open", ["P1", 5, "{}"]);
+check(await q1("select count(*)::int from public.ad_page_events where visitor = 'wa-phone-77'") === 2, "an open and a flat tap kept; a flat of another building isn't");
+check(await q1("select source || ':' || seconds from public.ad_page_events where event = 'flat_open'") === "whatsapp:42", "with where they came from and how long");
+r = await as(anon, "select public.visit_ad_book('building', 'H33PSH', 'wa-phone-77', '9833300000', 'Wa Tenant', $1::timestamptz, $2::jsonb)",
+  [T11, JSON.stringify({ utm_source: "whatsapp", utm_campaign: "H33PSH" })]);
+const wb = one(r);
+check(r.error == null && wb.calls_from && wb.calls_until, "booked from the WhatsApp page", r.error?.message);
+check(await q1(`select array_to_string(property_ids, ',') from public.ad_visit_bookings where id = '${wb.id}'`) === "B1", "the flat they tapped is on the visit");
+const waCid = await q1("select id::text from public.crm_clients where phone = '9833300000'");
+check(await q1("select count(*)::int from public.ad_page_events where visitor = 'wa-phone-77' and client_id is null") === 0
+  && await q1(`select client_id::text from public.visitor_clients where visitor = 'wa-phone-77'`) === waCid, "the phone is the client's now");
+check(await q1("select note from public.owner_building_leads where phone = '9833300000'") === "Booked from the WhatsApp page", "the request says WhatsApp");
+const desk = (kind = "contacts", target = "", fb = "", note = "", phone = "9833300000") =>
+  as(anon, "select public.visit_ad_desk($1, $2, 'wa-phone-77', $3, $4, $5, $6)", [wb.id, phone, kind, target, fb, note]);
+r = await desk();
+check(one(r)?.open === false && one(r).opens_at, "before the visit: closed, and when it opens", JSON.stringify(one(r)));
+check(Boolean((await desk("contacts", "", "", "", "9999999999")).error), "the wrong mobile gets nothing");
+await db.exec(`update public.ad_visit_bookings set slot_at = now() - interval '5 minutes' where id = '${wb.id}'`);
+await db.exec(`update public.owner_buildings set caretaker_name = 'Raju', caretaker_phone = '9812312312' where id = '${BLD}'`);
+r = await desk();
+const c = one(r);
+check(c?.open === true && c.caretaker.phone === "9812312312" && c.caretaker.name === "Raju" && c.manager.phone === "9146969162",
+  "from the visit's start: the caretaker, and MovEazy as manager where unset", JSON.stringify(c) + (r.error?.message || ""));
+await desk("call", "caretaker");
+await desk("feedback", "", "call_not_picked");
+await desk("call", "manager");
+check(Boolean((await desk("feedback", "", "loved")).error), "an unknown answer is refused");
+check(await q1(`select count(*)::int from public.building_call_events where phone = '9833300000' and source = 'ad'`) === 4, "in the building's call log, as from the ad page");
+check(/Called the caretaker from the ad page · BR Homes/.test(await q1(`select string_agg(body, ' | ') from public.crm_activities where client_id = '${waCid}'`)), "on the client's history");
+const crm = one(await as(viewer, "select public.crm_ad_visits(30)")).find((x) => x.id === wb.id);
+check(crm?.source === "whatsapp" && JSON.stringify(crm.flats) === '["101"]' && crm.called.length === 2 && crm.feedback[0].kind === "call_not_picked",
+  "the CRM sees the source, the flat, the calls and what they said", JSON.stringify(crm));
+const ov = one(await as({ uid: OWNER }, "select public.owner_qr_overview()"));
+const wa = (ov?.list ?? []).find((x) => x.name === "Wa Tenant");
+check(wa?.via === "moveazy" && wa.phone === "", "the owner: no number, even after calling", JSON.stringify(wa));
+const ob = one(await as({ uid: OWNER }, `select public.owner_building_tenants('${BLD}')`));
+const row = (ob?.tenants ?? []).find((x) => x.qr?.source === "ad");
+check(row && row.phone == null && row.via === "moveazy", "the owner's board too", JSON.stringify(row));
+await db.exec(`update public.ad_visit_bookings set slot_at = now() - interval '2 days' where id = '${wb.id}'`);
+check(one(await desk())?.open === false, "the next day: closed");
+r = await book("flat", "P1", "9844400000", T11, "Flat Only");
+await db.exec(`update public.ad_visit_bookings set slot_at = now() - interval '1 minute' where id = '${one(r).id}'`);
+const fd = one(await as(anon, "select public.visit_ad_desk($1, '9844400000', 'x-phone-1', 'contacts')", [one(r).id]));
+check(fd?.open === true && fd.caretaker == null && fd.manager.phone === "9146969162", "a flat outside a building: MovEazy as manager", JSON.stringify(fd));
+check(Boolean((await as(anon, "select * from public.ad_page_events")).error), "the events table is closed");
 
 console.log(passed ? "\nALL CHECKS PASSED" : "\nSOME CHECKS FAILED");
 process.exit(passed ? 0 : 1);
