@@ -492,6 +492,36 @@ end;
 $$;
 
 /**
+ * Save the property form's checked fields back onto a pending draft, without
+ * publishing anything. The draft stays in the inbox; "Review & publish" opens
+ * it again with everything filled. Only the team (crm.properties.write) can
+ * save, and only while the draft is still undecided.
+ */
+create or replace function public.crm_wa_draft_save_fields(p_id uuid, p_fields jsonb, p_missing text[] default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  d public.wa_drafts;
+begin
+  perform public.wa_require_writer();
+  select * into d from public.wa_drafts where id = p_id for update;
+  if d.id is null then raise exception 'That WhatsApp draft is gone.' using errcode = 'P0002'; end if;
+  if d.status <> 'pending' then raise exception 'This draft is already decided.' using errcode = '23514'; end if;
+
+  update public.wa_drafts
+     set fields = coalesce(p_fields, '{}'::jsonb),
+         missing = case when p_missing is null then d.missing else p_missing end
+   where id = d.id;
+
+  select * into d from public.wa_drafts where id = p_id;
+  return public.wa_draft_json(d);
+end;
+$$;
+
+/**
  * The form published the draft as p_property. A partner's flat becomes their
  * listing (partner app → My listings) and they hear it is live.
  */
