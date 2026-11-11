@@ -145,9 +145,6 @@ begin
   return null;
 end;
 $$;
-drop trigger if exists crm_requirements_lead_type on public.crm_client_requirements;
-create trigger crm_requirements_lead_type after insert or update on public.crm_client_requirements
-  for each row execute function public.crm_requirements_lead_type();
 
 -- A tenant filling in what they need (signed in).
 create or replace function public.user_requirements_lead_type()
@@ -161,9 +158,6 @@ begin
   return null;
 end;
 $$;
-drop trigger if exists user_requirements_lead_type on public.user_requirements;
-create trigger user_requirements_lead_type after insert or update on public.user_requirements
-  for each row execute function public.user_requirements_lead_type();
 
 -- ...or before signing in (the phone-first questionnaire).
 create or replace function public.lead_intake_lead_type()
@@ -183,9 +177,6 @@ begin
   return null;
 end;
 $$;
-drop trigger if exists lead_intake_lead_type on public.lead_intake;
-create trigger lead_intake_lead_type after insert or update on public.lead_intake
-  for each row execute function public.lead_intake_lead_type();
 
 -- Liking a flat.
 create or replace function public.listing_reactions_lead_type()
@@ -199,9 +190,6 @@ begin
   return null;
 end;
 $$;
-drop trigger if exists listing_reactions_lead_type on public.listing_reactions;
-create trigger listing_reactions_lead_type after insert or update on public.listing_reactions
-  for each row execute function public.listing_reactions_lead_type();
 
 -- Booking a visit: the site's own bookings, and a building's visit requests.
 create or replace function public.visit_bookings_lead_type()
@@ -215,9 +203,6 @@ begin
   return null;
 end;
 $$;
-drop trigger if exists visit_bookings_lead_type on public.visit_bookings;
-create trigger visit_bookings_lead_type after insert on public.visit_bookings
-  for each row execute function public.visit_bookings_lead_type();
 
 create or replace function public.building_leads_lead_type()
 returns trigger
@@ -230,9 +215,6 @@ begin
   return null;
 end;
 $$;
-drop trigger if exists building_leads_lead_type on public.owner_building_leads;
-create trigger building_leads_lead_type after insert on public.owner_building_leads
-  for each row execute function public.building_leads_lead_type();
 
 -- Anything the site logs that is a shortlist, a visit, an availability check, a like, a booking or a payment.
 create or replace function public.user_actions_lead_type()
@@ -248,9 +230,27 @@ begin
   return null;
 end;
 $$;
-drop trigger if exists user_actions_lead_type on public.user_actions;
-create trigger user_actions_lead_type after insert on public.user_actions
-  for each row execute function public.user_actions_lead_type();
+
+-- The triggers, on whichever of these tables this project has.
+do $$
+declare
+  t record;
+begin
+  for t in select * from (values
+    ('crm_client_requirements', 'crm_requirements_lead_type', 'after insert or update'),
+    ('user_requirements', 'user_requirements_lead_type', 'after insert or update'),
+    ('lead_intake', 'lead_intake_lead_type', 'after insert or update'),
+    ('listing_reactions', 'listing_reactions_lead_type', 'after insert or update'),
+    ('visit_bookings', 'visit_bookings_lead_type', 'after insert'),
+    ('owner_building_leads', 'building_leads_lead_type', 'after insert'),
+    ('user_actions', 'user_actions_lead_type', 'after insert')) v(tbl, fn, ev)
+  loop
+    if to_regclass('public.' || t.tbl) is not null then
+      execute format('drop trigger if exists %I on public.%I', t.fn, t.tbl);
+      execute format('create trigger %I %s on public.%I for each row execute function public.%I()', t.fn, t.ev, t.tbl, t.fn);
+    end if;
+  end loop;
+end $$;
 
 /** The team: mark a client Dormant, or bring them back to Active (or Probable). */
 create or replace function public.crm_lead_type_set(p_client uuid, p_type text)
