@@ -429,7 +429,10 @@ begin
 end;
 $$;
 
-/** Amenities ticked, and rent ranges per flat type (optional). */
+/**
+ * Amenities ticked, and rent ranges per flat type (optional). Once the society
+ * is live, only the rents can still change — they go straight onto its page.
+ */
 create or replace function public.partner_society_save(p jsonb)
 returns jsonb
 language plpgsql
@@ -437,13 +440,20 @@ security definer
 set search_path = public
 as $$
 declare
-  s    public.society_prospects := public.sp_editable(nullif(p ->> 'id', '')::uuid);
+  me   uuid := public.sp_require();
+  s    public.society_prospects;
   v_am text[];
   v_rents jsonb := '{}'::jsonb;
   k    text;
   lo   numeric;
   hi   numeric;
 begin
+  select * into s from public.society_prospects where id = nullif(p ->> 'id', '')::uuid and onboard_by = me;
+  if s.onboard_status = 'approved' then
+    if p ? 'amenities' then raise exception 'Amenities are set once a society is live — ask the MovEazy team to change them.' using errcode = '22023'; end if;
+  else
+    s := public.sp_editable(nullif(p ->> 'id', '')::uuid);
+  end if;
   if jsonb_typeof(p -> 'amenities') = 'array' then
     v_am := array(select distinct left(trim(x), 50) from jsonb_array_elements_text(p -> 'amenities') x where trim(x) <> '' limit 40);
     update public.society_prospects set partner_amenities = v_am,
@@ -462,7 +472,9 @@ begin
       end if;
       v_rents := v_rents || jsonb_build_object(k, jsonb_build_array(coalesce(lo, hi), coalesce(hi, lo)));
     end loop;
-    update public.society_prospects set partner_rents = v_rents where id = s.id;
+    update public.society_prospects set partner_rents = v_rents,
+           rents = case when onboard_status = 'approved' then rents || v_rents else rents end
+     where id = s.id;
   end if;
   update public.society_prospects set updated_at = now(), updated_by = 'partner:' || auth.uid() where id = s.id;
   return public.sp_json(s.id);
