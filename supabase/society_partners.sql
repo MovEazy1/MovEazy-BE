@@ -422,17 +422,17 @@ set search_path = public
 as $$
 declare
   s    public.society_prospects := public.sp_editable(nullif(p ->> 'id', '')::uuid);
-  am   text[];
-  rents jsonb := '{}'::jsonb;
+  v_am text[];
+  v_rents jsonb := '{}'::jsonb;
   k    text;
   lo   numeric;
   hi   numeric;
 begin
   if jsonb_typeof(p -> 'amenities') = 'array' then
-    am := array(select distinct left(trim(x), 50) from jsonb_array_elements_text(p -> 'amenities') x where trim(x) <> '' limit 40);
-    update public.society_prospects set partner_amenities = am,
+    v_am := array(select distinct left(trim(x), 50) from jsonb_array_elements_text(p -> 'amenities') x where trim(x) <> '' limit 40);
+    update public.society_prospects set partner_amenities = v_am,
            -- A photo of an amenity they've unticked goes with it.
-           amenity_photos = coalesce((select jsonb_object_agg(e.key, e.value) from jsonb_each(amenity_photos) e where e.key = any(am)), '{}'::jsonb)
+           amenity_photos = coalesce((select jsonb_object_agg(e.key, e.value) from jsonb_each(amenity_photos) e where e.key = any(v_am)), '{}'::jsonb)
      where id = s.id;
   end if;
   if jsonb_typeof(p -> 'rents') = 'object' then
@@ -444,9 +444,9 @@ begin
       if coalesce(lo, hi) < 3000 or coalesce(hi, lo) > 1000000 or (lo is not null and hi is not null and lo > hi) then
         raise exception 'Check the rent for %: min below max, in rupees a month.', case k when '1rk' then '1 RK' else k || ' BHK' end using errcode = '22023';
       end if;
-      rents := rents || jsonb_build_object(k, jsonb_build_array(coalesce(lo, hi), coalesce(hi, lo)));
+      v_rents := v_rents || jsonb_build_object(k, jsonb_build_array(coalesce(lo, hi), coalesce(hi, lo)));
     end loop;
-    update public.society_prospects set partner_rents = rents where id = s.id;
+    update public.society_prospects set partner_rents = v_rents where id = s.id;
   end if;
   update public.society_prospects set updated_at = now(), updated_by = 'partner:' || auth.uid() where id = s.id;
   return public.sp_json(s.id);
