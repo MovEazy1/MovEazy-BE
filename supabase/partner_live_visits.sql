@@ -1,5 +1,5 @@
 -- ─────────────────────────────────────────────────────────────────────────────
--- Partner visits: the CRM gives a partner a tenant's visit to a flat, the
+-- Partner live visits: the CRM gives a partner a tenant's visit to a flat, the
 -- partner shares where to meet, the tenant says "I am coming", and both see
 -- each other live until it's done (MovEazy-FE lib/partnerVisits.js,
 -- pages/partners/VisitCard*.jsx, components/LiveVisit*.jsx,
@@ -25,7 +25,7 @@
 
 begin;
 
-create table if not exists public.partner_visits (
+create table if not exists public.partner_live_visits (
   id             uuid primary key default gen_random_uuid(),
   client_id      uuid not null references public.crm_clients (id) on delete cascade,
   property_id    text not null references public.inventory (property_id) on delete cascade,
@@ -49,9 +49,9 @@ create table if not exists public.partner_visits (
   created_at     timestamptz not null default now(),
   updated_at     timestamptz not null default now()
 );
-create unique index if not exists partner_visits_booking_key on public.partner_visits (booking_id) where booking_id is not null and status <> 'cancelled';
-create index if not exists partner_visits_broker_idx on public.partner_visits (broker_id, visit_at desc);
-create index if not exists partner_visits_client_idx on public.partner_visits (client_id, visit_at desc);
+create unique index if not exists partner_live_visits_booking_key on public.partner_live_visits (booking_id) where booking_id is not null and status <> 'cancelled';
+create index if not exists partner_live_visits_broker_idx on public.partner_live_visits (broker_id, visit_at desc);
+create index if not exists partner_live_visits_client_idx on public.partner_live_visits (client_id, visit_at desc);
 
 -- Where a partner meets tenants for a flat: offered again on their next visit there.
 create table if not exists public.partner_flat_spots (
@@ -64,9 +64,9 @@ create table if not exists public.partner_flat_spots (
   primary key (broker_id, property_id)
 );
 
-alter table public.partner_visits enable row level security;
+alter table public.partner_live_visits enable row level security;
 alter table public.partner_flat_spots enable row level security;
-revoke all on public.partner_visits, public.partner_flat_spots from anon, authenticated;
+revoke all on public.partner_live_visits, public.partner_flat_spots from anon, authenticated;
 
 -- Partner notifications gain the visit kinds (the kinds already allowed are kept).
 do $$
@@ -87,7 +87,7 @@ end $$;
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
 /** Live: the tenant is coming and the 3 hours aren't up. */
-create or replace function public.pv_live(v public.partner_visits)
+create or replace function public.pv_live(v public.partner_live_visits)
 returns boolean
 language sql
 stable
@@ -111,7 +111,7 @@ as $$
 $$;
 
 /** The latest answer a side gave on this visit's flat for this tenant. */
-create or replace function public.pv_answer(v public.partner_visits, p_by text)
+create or replace function public.pv_answer(v public.partner_live_visits, p_by text)
 returns jsonb
 language sql
 stable
@@ -125,7 +125,7 @@ as $$
 $$;
 
 /** One visit, for any side (the caller decides what each side may see). */
-create or replace function public.pv_json(v public.partner_visits)
+create or replace function public.pv_json(v public.partner_live_visits)
 returns jsonb
 language sql
 stable
@@ -159,18 +159,18 @@ $$;
 
 /** The tenant's own visit (by account, or the number on their profile), locked for change. */
 create or replace function public.pv_mine_tenant(p_id uuid)
-returns public.partner_visits
+returns public.partner_live_visits
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v  public.partner_visits;
+  v  public.partner_live_visits;
   ph text;
 begin
   if auth.uid() is null then raise exception 'Sign in to see your visit.' using errcode = '42501'; end if;
   select public.normalize_mobile(p.phone) into ph from public.user_profiles p where p.id = auth.uid();
-  select pv.* into v from public.partner_visits pv join public.crm_clients c on c.id = pv.client_id
+  select pv.* into v from public.partner_live_visits pv join public.crm_clients c on c.id = pv.client_id
    where pv.id = p_id and (c.user_id = auth.uid() or (coalesce(ph, '') <> '' and public.normalize_mobile(c.phone) = ph))
    for update of pv;
   if v.id is null then raise exception 'This visit isn''t on your account. Sign in with the number you gave MovEazy.' using errcode = '42501'; end if;
@@ -179,15 +179,15 @@ end;
 $$;
 
 create or replace function public.pv_mine_partner(p_id uuid)
-returns public.partner_visits
+returns public.partner_live_visits
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v public.partner_visits;
+  v public.partner_live_visits;
 begin
-  select * into v from public.partner_visits where id = p_id and broker_id = auth.uid() for update;
+  select * into v from public.partner_live_visits where id = p_id and broker_id = auth.uid() for update;
   if v.id is null or not public.is_approved_partner() then raise exception 'That visit isn''t yours.' using errcode = '42501'; end if;
   return v;
 end;
@@ -199,7 +199,7 @@ $$;
  * Partner visits from p_from on, every status, plus the booked visits from
  * p_from on that no partner has yet (to assign).
  */
-create or replace function public.crm_partner_visits(p_from timestamptz default null)
+create or replace function public.crm_live_visits(p_from timestamptz default null)
 returns jsonb
 language plpgsql
 stable
@@ -217,14 +217,14 @@ begin
                -- The CRM sees where both are while it's live, sharing or not.
                'broker_loc', case when public.pv_live(v) then v.broker_loc end, 'tenant_loc', case when public.pv_live(v) then v.tenant_loc end)
              order by v.visit_at nulls last, v.created_at)
-        from public.partner_visits v where coalesce(v.visit_at, v.created_at) >= since or v.status in ('assigned', 'shared', 'coming')), '[]'::jsonb),
+        from public.partner_live_visits v where coalesce(v.visit_at, v.created_at) >= since or v.status in ('assigned', 'shared', 'coming')), '[]'::jsonb),
     'unassigned', coalesce((
       select jsonb_agg(jsonb_build_object('booking_id', b.id, 'visit_at', b.slot_at, 'flat', public.pv_flat(b.property_id),
                'client', (select jsonb_build_object('id', c.id, 'name', c.name, 'phone', c.phone) from public.crm_clients c where c.user_id = b.user_id limit 1))
              order by b.slot_at nulls last)
         from public.visit_bookings b
        where coalesce(b.slot_at, b.created_at) >= since and coalesce(b.status, '') not in ('cancelled', 'done', 'completed')
-         and not exists (select 1 from public.partner_visits v where v.booking_id = b.id and v.status <> 'cancelled')
+         and not exists (select 1 from public.partner_live_visits v where v.booking_id = b.id and v.status <> 'cancelled')
          and exists (select 1 from public.crm_clients c where c.user_id = b.user_id)), '[]'::jsonb));
 end;
 $$;
@@ -234,7 +234,7 @@ $$;
  * property_id, visit_at, broker_id }. A booked visit brings its own client,
  * flat and time. The partner is told.
  */
-create or replace function public.crm_partner_visit_save(p jsonb)
+create or replace function public.crm_live_visit_save(p jsonb)
 returns jsonb
 language plpgsql
 security definer
@@ -249,7 +249,7 @@ declare
   brk  uuid := nullif(p ->> 'broker_id', '')::uuid;
   at   timestamptz := nullif(p ->> 'visit_at', '')::timestamptz;
   b    record;
-  v    public.partner_visits;
+  v    public.partner_live_visits;
   old  uuid;
   nm   text;
   flat text;
@@ -265,11 +265,11 @@ begin
   if brk is null or not exists (select 1 from public.broker_partners where user_id = brk and status = 'approved') then raise exception 'Pick an approved partner.' using errcode = '22023'; end if;
 
   if vid is null then
-    insert into public.partner_visits (client_id, property_id, broker_id, booking_id, visit_at, assigned_by)
+    insert into public.partner_live_visits (client_id, property_id, broker_id, booking_id, visit_at, assigned_by)
     values (cid, pid, brk, bid, at, who) returning * into v;
   else
-    select broker_id into old from public.partner_visits where id = vid;
-    update public.partner_visits set client_id = cid, property_id = pid, broker_id = brk, visit_at = at, updated_at = now(),
+    select broker_id into old from public.partner_live_visits where id = vid;
+    update public.partner_live_visits set client_id = cid, property_id = pid, broker_id = brk, visit_at = at, updated_at = now(),
            -- A new partner starts over: their own spot, their own sharing.
            status = case when broker_id <> brk and status in ('shared', 'coming') then 'assigned' else status end,
            meet_lat = case when broker_id <> brk then null else meet_lat end, meet_lng = case when broker_id <> brk then null else meet_lng end
@@ -292,17 +292,17 @@ begin
 end;
 $$;
 
-create or replace function public.crm_partner_visit_cancel(p_id uuid)
+create or replace function public.crm_live_visit_cancel(p_id uuid)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v public.partner_visits;
+  v public.partner_live_visits;
 begin
   if not public.has_admin_scope('crm.clients.write') then raise exception 'Needs permission to edit clients.' using errcode = '42501'; end if;
-  update public.partner_visits set status = 'cancelled', cancelled_at = now(), updated_at = now()
+  update public.partner_live_visits set status = 'cancelled', cancelled_at = now(), updated_at = now()
    where id = p_id and status not in ('done', 'cancelled') returning * into v;
   if v.id is null then raise exception 'That visit is already done or cancelled.' using errcode = '22023'; end if;
   insert into public.partner_notifications (broker_id, kind, title, body, link)
@@ -314,7 +314,7 @@ $$;
 /* ── Partner ──────────────────────────────────────────────────────────────── */
 
 /** The partner's visits: open ones, and those done in the last day. With the spot they used here before. */
-create or replace function public.partner_visits()
+create or replace function public.partner_live_visits_mine()
 returns jsonb
 language plpgsql
 stable
@@ -328,27 +328,27 @@ begin
              (select jsonb_build_object('lat', s.lat, 'lng', s.lng, 'link', s.link) from public.partner_flat_spots s
                where s.broker_id = v.broker_id and s.property_id = v.property_id))
            order by (v.status = 'done'), v.visit_at nulls last)
-      from public.partner_visits v
+      from public.partner_live_visits v
      where v.broker_id = auth.uid() and (v.status in ('assigned', 'shared', 'coming') or (v.status = 'done' and v.done_at > now() - interval '1 day'))), '[]'::jsonb);
 end;
 $$;
 
 /** Where to meet: a pin (and the Google Maps link it came from, if any). Remembered for this partner and flat. */
-create or replace function public.partner_visit_share(p_id uuid, p_lat numeric, p_lng numeric, p_link text default '')
+create or replace function public.partner_live_visit_share(p_id uuid, p_lat numeric, p_lng numeric, p_link text default '')
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v    public.partner_visits := public.pv_mine_partner(p_id);
+  v    public.partner_live_visits := public.pv_mine_partner(p_id);
   link text := case when coalesce(p_link, '') ~ '^https://' then left(p_link, 500) else '' end;
 begin
   if v.status in ('done', 'cancelled') then raise exception 'This visit is over.' using errcode = '22023'; end if;
   if p_lat is null or p_lng is null or p_lat not between 6 and 37.5 or p_lng not between 68 and 97.5 then
     raise exception 'Mark the spot on the map, or paste a Google Maps link with a pin.' using errcode = '22023';
   end if;
-  update public.partner_visits set meet_lat = round(p_lat, 6), meet_lng = round(p_lng, 6), meet_link = link,
+  update public.partner_live_visits set meet_lat = round(p_lat, 6), meet_lng = round(p_lng, 6), meet_link = link,
          status = case when status = 'assigned' then 'shared' else status end, shared_at = coalesce(shared_at, now()), updated_at = now()
    where id = v.id returning * into v;
   insert into public.partner_flat_spots (broker_id, property_id, lat, lng, link) values (v.broker_id, v.property_id, v.meet_lat, v.meet_lng, link)
@@ -360,49 +360,49 @@ end;
 $$;
 
 /** The partner's phone, while live. */
-create or replace function public.partner_visit_ping(p_id uuid, p_lat numeric, p_lng numeric, p_acc numeric default null)
+create or replace function public.partner_live_visit_ping(p_id uuid, p_lat numeric, p_lng numeric, p_acc numeric default null)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v public.partner_visits := public.pv_mine_partner(p_id);
+  v public.partner_live_visits := public.pv_mine_partner(p_id);
 begin
   if public.pv_live(v) and v.broker_sharing then
-    update public.partner_visits set broker_loc = public.pv_spot(p_lat, p_lng, p_acc) where id = v.id returning * into v;
+    update public.partner_live_visits set broker_loc = public.pv_spot(p_lat, p_lng, p_acc) where id = v.id returning * into v;
   end if;
   return public.pv_json(v);
 end;
 $$;
 
-create or replace function public.partner_visit_sharing(p_id uuid, p_on boolean)
+create or replace function public.partner_live_visit_sharing(p_id uuid, p_on boolean)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v public.partner_visits := public.pv_mine_partner(p_id);
+  v public.partner_live_visits := public.pv_mine_partner(p_id);
 begin
-  update public.partner_visits set broker_sharing = coalesce(p_on, false), broker_loc = case when coalesce(p_on, false) then broker_loc end
+  update public.partner_live_visits set broker_sharing = coalesce(p_on, false), broker_loc = case when coalesce(p_on, false) then broker_loc end
    where id = v.id returning * into v;
   return public.pv_json(v);
 end;
 $$;
 
 /** The visit happened: live sharing stops. */
-create or replace function public.partner_visit_done(p_id uuid)
+create or replace function public.partner_live_visit_done(p_id uuid)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v public.partner_visits := public.pv_mine_partner(p_id);
+  v public.partner_live_visits := public.pv_mine_partner(p_id);
 begin
   if v.status = 'cancelled' then raise exception 'This visit was cancelled.' using errcode = '22023'; end if;
-  update public.partner_visits set status = 'done', done_at = coalesce(done_at, now()), broker_loc = null, tenant_loc = null, updated_at = now()
+  update public.partner_live_visits set status = 'done', done_at = coalesce(done_at, now()), broker_loc = null, tenant_loc = null, updated_at = now()
    where id = v.id returning * into v;
   insert into public.crm_activities (client_id, type, body) values (v.client_id, 'visit', format('Visit done: %s (partner)', v.property_id));
   return public.pv_json(v);
@@ -410,14 +410,14 @@ end;
 $$;
 
 /** How it went, from the partner (the tenant-views labels): "partner said". */
-create or replace function public.partner_visit_respond(p_id uuid, p jsonb)
+create or replace function public.partner_live_visit_respond(p_id uuid, p jsonb)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v   public.partner_visits := public.pv_mine_partner(p_id);
+  v   public.partner_live_visits := public.pv_mine_partner(p_id);
   vid uuid;
   who text;
 begin
@@ -435,7 +435,7 @@ $$;
 /* ── Tenant ───────────────────────────────────────────────────────────────── */
 
 /** The signed-in tenant's visits with a partner: open ones and those done in the last day. */
-create or replace function public.tenant_partner_visits()
+create or replace function public.tenant_live_visits()
 returns jsonb
 language plpgsql
 stable
@@ -449,26 +449,26 @@ begin
   select public.normalize_mobile(p.phone) into ph from public.user_profiles p where p.id = auth.uid();
   return coalesce((
     select jsonb_agg(public.pv_json(v) - 'client' order by (v.status = 'done'), v.visit_at nulls last)
-      from public.partner_visits v join public.crm_clients c on c.id = v.client_id
+      from public.partner_live_visits v join public.crm_clients c on c.id = v.client_id
      where (c.user_id = auth.uid() or (coalesce(ph, '') <> '' and public.normalize_mobile(c.phone) = ph))
        and (v.status in ('assigned', 'shared', 'coming') or (v.status = 'done' and v.done_at > now() - interval '1 day'))), '[]'::jsonb);
 end;
 $$;
 
 /** "I am coming": both start sharing where they are, for 3 hours. The partner is told. */
-create or replace function public.tenant_visit_coming(p_id uuid)
+create or replace function public.tenant_live_visit_coming(p_id uuid)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v  public.partner_visits := public.pv_mine_tenant(p_id);
+  v  public.partner_live_visits := public.pv_mine_tenant(p_id);
   nm text;
 begin
   if v.status = 'assigned' then raise exception 'Your partner hasn''t shared where to meet yet.' using errcode = '22023'; end if;
   if v.status in ('done', 'cancelled') then raise exception 'This visit is over.' using errcode = '22023'; end if;
-  update public.partner_visits set status = 'coming', coming_at = now(), live_until = now() + interval '3 hours',
+  update public.partner_live_visits set status = 'coming', coming_at = now(), live_until = now() + interval '3 hours',
          tenant_sharing = true, broker_sharing = true, updated_at = now()
    where id = v.id returning * into v;
   select c.name into nm from public.crm_clients c where c.id = v.client_id;
@@ -481,46 +481,46 @@ begin
 end;
 $$;
 
-create or replace function public.tenant_visit_ping(p_id uuid, p_lat numeric, p_lng numeric, p_acc numeric default null)
+create or replace function public.tenant_live_visit_ping(p_id uuid, p_lat numeric, p_lng numeric, p_acc numeric default null)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v public.partner_visits := public.pv_mine_tenant(p_id);
+  v public.partner_live_visits := public.pv_mine_tenant(p_id);
 begin
   if public.pv_live(v) and v.tenant_sharing then
-    update public.partner_visits set tenant_loc = public.pv_spot(p_lat, p_lng, p_acc) where id = v.id returning * into v;
+    update public.partner_live_visits set tenant_loc = public.pv_spot(p_lat, p_lng, p_acc) where id = v.id returning * into v;
   end if;
   return public.pv_json(v) - 'client';
 end;
 $$;
 
-create or replace function public.tenant_visit_sharing(p_id uuid, p_on boolean)
+create or replace function public.tenant_live_visit_sharing(p_id uuid, p_on boolean)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v public.partner_visits := public.pv_mine_tenant(p_id);
+  v public.partner_live_visits := public.pv_mine_tenant(p_id);
 begin
-  update public.partner_visits set tenant_sharing = coalesce(p_on, false), tenant_loc = case when coalesce(p_on, false) then tenant_loc end
+  update public.partner_live_visits set tenant_sharing = coalesce(p_on, false), tenant_loc = case when coalesce(p_on, false) then tenant_loc end
    where id = v.id returning * into v;
   return public.pv_json(v) - 'client';
 end;
 $$;
 
 /** How it went, from the tenant: "tenant said". */
-create or replace function public.tenant_visit_respond(p_id uuid, p jsonb)
+create or replace function public.tenant_live_visit_respond(p_id uuid, p jsonb)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v   public.partner_visits := public.pv_mine_tenant(p_id);
+  v   public.partner_live_visits := public.pv_mine_tenant(p_id);
   vid uuid;
   nm  text;
 begin
@@ -542,17 +542,17 @@ declare
   f text;
 begin
   foreach f in array array[
-    'public.pv_live(public.partner_visits)', 'public.pv_flat(text)', 'public.pv_answer(public.partner_visits, text)',
-    'public.pv_json(public.partner_visits)', 'public.pv_spot(numeric, numeric, numeric)', 'public.pv_mine_tenant(uuid)',
+    'public.pv_live(public.partner_live_visits)', 'public.pv_flat(text)', 'public.pv_answer(public.partner_live_visits, text)',
+    'public.pv_json(public.partner_live_visits)', 'public.pv_spot(numeric, numeric, numeric)', 'public.pv_mine_tenant(uuid)',
     'public.pv_mine_partner(uuid)'] loop
     execute format('revoke all on function %s from public, anon, authenticated', f);
   end loop;
   foreach f in array array[
-    'public.crm_partner_visits(timestamptz)', 'public.crm_partner_visit_save(jsonb)', 'public.crm_partner_visit_cancel(uuid)',
-    'public.partner_visits()', 'public.partner_visit_share(uuid, numeric, numeric, text)', 'public.partner_visit_ping(uuid, numeric, numeric, numeric)',
-    'public.partner_visit_sharing(uuid, boolean)', 'public.partner_visit_done(uuid)', 'public.partner_visit_respond(uuid, jsonb)',
-    'public.tenant_partner_visits()', 'public.tenant_visit_coming(uuid)', 'public.tenant_visit_ping(uuid, numeric, numeric, numeric)',
-    'public.tenant_visit_sharing(uuid, boolean)', 'public.tenant_visit_respond(uuid, jsonb)'] loop
+    'public.crm_live_visits(timestamptz)', 'public.crm_live_visit_save(jsonb)', 'public.crm_live_visit_cancel(uuid)',
+    'public.partner_live_visits_mine()', 'public.partner_live_visit_share(uuid, numeric, numeric, text)', 'public.partner_live_visit_ping(uuid, numeric, numeric, numeric)',
+    'public.partner_live_visit_sharing(uuid, boolean)', 'public.partner_live_visit_done(uuid)', 'public.partner_live_visit_respond(uuid, jsonb)',
+    'public.tenant_live_visits()', 'public.tenant_live_visit_coming(uuid)', 'public.tenant_live_visit_ping(uuid, numeric, numeric, numeric)',
+    'public.tenant_live_visit_sharing(uuid, boolean)', 'public.tenant_live_visit_respond(uuid, jsonb)'] loop
     execute format('revoke all on function %s from public, anon', f);
     execute format('grant execute on function %s to authenticated', f);
   end loop;
