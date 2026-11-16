@@ -61,7 +61,7 @@ do $$ begin
     alter table public.society_prospects drop constraint society_prospects_road_check;
   end if;
   alter table public.society_prospects add constraint society_prospects_road_check
-    check (road in ('hsr', 'sarjapur', 'haralur', 'silver', 'hosa', 'kudlu', 'other'));
+    check (road ~ '^[a-z][a-z0-9_]{1,23}$');
   if not exists (select 1 from pg_constraint where conname = 'society_prospects_onboard_status_check') then
     alter table public.society_prospects add constraint society_prospects_onboard_status_check
       check (onboard_status is null or onboard_status in ('draft', 'submitted', 'sent_back', 'approved'));
@@ -422,7 +422,7 @@ begin
     raise exception '% is already on the map right here — open it from the list.', dup.name using errcode = '23505';
   end if;
   insert into public.society_prospects (name, road, area, lat, lng, added_by_partner, created_by, updated_by)
-  values (left(nm, 120), case when p_road in ('hsr', 'sarjapur', 'haralur', 'silver', 'hosa', 'kudlu') then p_road else 'other' end,
+  values (left(nm, 120), case when p_road ~ '^[a-z][a-z0-9_]{1,23}$' then p_road else 'other' end,
           left(coalesce(p_area, ''), 80), p_lat, p_lng, true, 'partner:' || me, 'partner:' || me)
   returning id into pid;
   return public.partner_society_start(pid);

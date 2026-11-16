@@ -32,7 +32,7 @@ create table if not exists public.society_prospects (
   id             uuid primary key default gen_random_uuid(),
   place_id       text not null default '',
   name           text not null check (length(trim(name)) between 2 and 120),
-  road           text not null default 'hsr' check (road in ('hsr', 'sarjapur', 'haralur', 'silver', 'hosa', 'kudlu')),
+  road           text not null default 'hsr' check (road ~ '^[a-z][a-z0-9_]{1,23}$'),
   area           text not null default '',
   address        text not null default '',
   lat            numeric,
@@ -176,7 +176,7 @@ begin
   update public.society_prospects s set
     name           = case when p ? 'name' then trim(p ->> 'name') else s.name end,
     area           = case when p ? 'area' then left(trim(coalesce(p ->> 'area', '')), 80) else s.area end,
-    road           = case when p ->> 'road' in ('hsr', 'sarjapur', 'haralur', 'silver', 'hosa', 'kudlu') then p ->> 'road' else s.road end,
+    road           = case when p ->> 'road' ~ '^[a-z][a-z0-9_]{1,23}$' then p ->> 'road' else s.road end,
     status         = case when p ->> 'status' in ('prospect', 'contacted', 'interested', 'onboarded') then p ->> 'status' else s.status end,
     notes          = case when p ? 'notes' then left(coalesce(p ->> 'notes', ''), 4000) else s.notes end,
     last_contacted = case when p ? 'last_contacted' then nullif(p ->> 'last_contacted', '')::date else s.last_contacted end,
@@ -292,7 +292,7 @@ begin
     if isnew then
       insert into public.society_prospects (place_id, name, road, area, address, lat, lng, maps_url, created_by, updated_by)
       values (r ->> 'place_id', left(trim(r ->> 'name'), 120),
-              case when r ->> 'road' in ('hsr', 'sarjapur', 'haralur', 'silver', 'hosa', 'kudlu') then r ->> 'road' else 'hsr' end,
+              case when r ->> 'road' ~ '^[a-z][a-z0-9_]{1,23}$' then r ->> 'road' else 'hsr' end,
               left(coalesce(r ->> 'area', ''), 80), left(coalesce(r ->> 'address', ''), 400),
               nullif(r ->> 'lat', '')::numeric, nullif(r ->> 'lng', '')::numeric,
               case when coalesce(r ->> 'maps_url', '') ~ '^https://' then left(r ->> 'maps_url', 400) else '' end, who, who)
