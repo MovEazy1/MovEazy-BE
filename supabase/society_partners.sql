@@ -77,6 +77,22 @@ do $$ begin
     check (source in ('team', 'google', 'partner'));
 end $$;
 
+-- Partner notifications gain two kinds: 'society' (switched on, approved, sent
+-- back) and 'society_lead' (a tenant asked for flats). The kinds already
+-- allowed are read off the existing check and kept.
+do $$
+declare
+  d    text;
+  vals text[];
+begin
+  select pg_get_constraintdef(oid) into d from pg_constraint where conname = 'partner_notifications_kind_check';
+  if d is not null and position('''society_lead''' in d) = 0 then
+    vals := array(select m[1] from regexp_matches(d, '''([a-z_]+)''', 'g') m) || array['society', 'society_lead'];
+    alter table public.partner_notifications drop constraint partner_notifications_kind_check;
+    execute format('alter table public.partner_notifications add constraint partner_notifications_kind_check check (kind = any (%L::text[]))', vals);
+  end if;
+end $$;
+
 /* ── Society leads ────────────────────────────────────────────────────────── */
 
 create table if not exists public.society_leads (
