@@ -60,7 +60,8 @@ create table public.partner_group_members (group_id uuid not null references pub
 create table public.partner_group_shares (property_id text, group_id uuid, share_pct numeric);
 create table public.partner_notifications (id bigint generated always as identity primary key, broker_id uuid not null, kind text not null,
   title text not null, body text not null default '', link text not null default '', created_at timestamptz not null default now(), read_at timestamptz,
-  constraint partner_notifications_kind_check check (kind = any (array['tenant_liked', 'society']::text[])));
+  constraint partner_notifications_kind_check check (kind = any ('{tenant_liked,society,visit_assigned}'::text[])));
+insert into public.partner_notifications (broker_id, kind, title) values ('${OWNER.uid}', 'visit_assigned', 'old row');
 create function public.is_approved_partner() returns boolean language sql stable security definer as $$
   select exists (select 1 from public.broker_partners where user_id = auth.uid() and status = 'approved') $$;
 create function public.is_partner_group_member(g uuid) returns boolean language sql stable security definer as $$
@@ -79,13 +80,13 @@ await db.exec(file("partner_group_add.sql"));
 await db.exec(file("partner_group_add.sql"));
 check(true, "partner_group_add.sql applies, and re-applies over itself");
 const kinds = (await q(db, "select pg_get_constraintdef(oid) d from pg_constraint where conname = 'partner_notifications_kind_check'"))[0].d;
-check(/tenant_liked/.test(kinds) && /group_added/.test(kinds) && /group_joined/.test(kinds), "notification kinds kept, two added", kinds);
+check(/tenant_liked/.test(kinds) && /visit_assigned/.test(kinds) && !/text,|,text|kind,/.test(kinds.split("ANY")[1] || "") && /group_added/.test(kinds) && /group_joined/.test(kinds), "notification kinds kept, two added", kinds);
 
 console.log("\na member adds an approved partner by number");
 let r = await as(db, MEMBER, `select public.partner_add_member_by_phone('${G}', '+91 80000 00004')`);
 check(!r.error && one(r)?.status === "added" && one(r)?.name === "Kiran", "Ravi (a plain member) adds Kiran by his second number — in straight away", r.error?.message ?? JSON.stringify(one(r)));
 check((await q(db, `select role from public.partner_group_members where group_id = '${G}' and user_id = '${NEWBIE.uid}'`))[0]?.role === "member", "Kiran is a member");
-const notes = await q(db, "select broker_id, kind, title, body from public.partner_notifications order by id");
+const notes = await q(db, "select broker_id, kind, title, body from public.partner_notifications where title <> 'old row' order by id");
 check(notes.some((n) => n.broker_id === NEWBIE.uid && n.kind === "group_added" && n.title === "Ravi added you to White Field Bros"), "Kiran is told who added him", JSON.stringify(notes));
 check(notes.filter((n) => n.kind === "group_joined").map((n) => n.broker_id).sort().join() === [OWNER.uid, ADMIN.uid].sort().join(),
   "the owner and the admin are told (not Ravi, not Kiran)");

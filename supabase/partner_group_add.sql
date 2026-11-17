@@ -44,7 +44,17 @@ declare
 begin
   select pg_get_constraintdef(oid) into d from pg_constraint where conname = 'partner_notifications_kind_check';
   if d is not null and position('group_joined' in d) = 0 then
-    vals := array(select m[1] from regexp_matches(d, '''([a-z_]+)''', 'g') m) || array['group_added', 'group_joined'];
+    -- The definition reads either ANY (ARRAY['a'::text, …]) or ANY ('{a,b,…}'::text[])
+    -- (after an earlier re-write): take every word in it but the SQL ones, plus
+    -- every kind already stored, so no existing row can fall outside.
+    vals := array(
+      select w from (
+        select (regexp_matches(d, '[a-z][a-z_]*', 'g'))[1] as w
+        union select kind from public.partner_notifications
+        union select unnest(array['group_added', 'group_joined'])
+      ) x
+      where w not in ('kind', 'any', 'array', 'text', 'check')
+      order by w);
     alter table public.partner_notifications drop constraint partner_notifications_kind_check;
     execute format('alter table public.partner_notifications add constraint partner_notifications_kind_check check (kind = any (%L::text[]))', vals);
   end if;
