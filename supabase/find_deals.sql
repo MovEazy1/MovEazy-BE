@@ -68,48 +68,7 @@ as $$
   select date_trunc('week', now() at time zone 'Asia/Kolkata')::date;
 $$;
 
-/**
- * Why flat `p` is a steal, from our own listings: "18% below the 2 BHK
- * average in Kasavanahalli" (3+ like flats there), else across MovEazy (5+).
- * Null when it isn't below either — the site then shows its best facts.
- */
-create or replace function public.deal_reason(p text)
-returns text
-language plpgsql
-stable
-security definer
-set search_path = public
-as $$
-declare
-  f   record;
-  avg_area numeric; n_area int;
-  avg_all  numeric; n_all  int;
-  pct int;
-begin
-  select property_id, flat_type, rent, area into f from public.inventory where property_id = p;
-  if f.property_id is null or coalesce(f.rent, 0) <= 0 or coalesce(f.flat_type, '') = '' then return null; end if;
-
-  select avg(i.rent), count(*) into avg_area, n_area
-    from public.inventory i
-   where i.status = 'published' and i.property_id <> p and i.rent > 0
-     and lower(trim(i.flat_type)) = lower(trim(f.flat_type))
-     and lower(trim(coalesce(i.area, ''))) = lower(trim(coalesce(f.area, ''))) and coalesce(f.area, '') <> '';
-  if n_area >= 3 and f.rent < avg_area * 0.95 then
-    pct := round((1 - f.rent / avg_area) * 100);
-    return format('%s%% below the %s average in %s', pct, trim(f.flat_type), trim(f.area));
-  end if;
-
-  select avg(i.rent), count(*) into avg_all, n_all
-    from public.inventory i
-   where i.status = 'published' and i.property_id <> p and i.rent > 0
-     and lower(trim(i.flat_type)) = lower(trim(f.flat_type));
-  if n_all >= 5 and f.rent < avg_all * 0.95 then
-    pct := round((1 - f.rent / avg_all) * 100);
-    return format('%s%% below the average %s on MovEazy', pct, trim(f.flat_type));
-  end if;
-  return null;
-end;
-$$;
+/* deal_reason(p) — why a flat is a deal — lives in deal_standards.sql now (against the CRM's standard rents). */
 
 /** One deal flat as the site draws it: the public listing columns, why it's a steal, and whether it's gone. */
 create or replace function public.deal_flat_json(p text)
