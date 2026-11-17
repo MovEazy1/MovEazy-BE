@@ -315,7 +315,11 @@ begin
                  'by', case when s.onboard_by is not null and s.onboard_by <> me
                              and (s.onboard_status in ('submitted', 'approved') or s.onboard_locked_until > now())
                             then public.sp_partner_name(s.onboard_by) end,
-                 'locked_until', case when s.onboard_by <> me then s.onboard_locked_until end) j
+                 'locked_until', case when s.onboard_by <> me then s.onboard_locked_until end,
+                 -- For the map's preview card: the first amenities and the rents (the partner's, else research).
+                 'amenities', to_jsonb(coalesce(s.amenities[1:6], '{}'::text[])),
+                 'amenity_count', coalesce(cardinality(s.amenities), 0),
+                 'rents', case when coalesce(s.partner_rents, '{}'::jsonb) <> '{}'::jsonb then s.partner_rents else coalesce(s.rents, '{}'::jsonb) end) j
           from public.society_prospects s
          where not s.hidden and s.lat is not null
          order by 2 nulls last, s.name
