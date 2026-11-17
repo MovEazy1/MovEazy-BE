@@ -69,6 +69,9 @@ do $$ begin
 end $$;
 
 alter table public.society_prospect_contacts add column if not exists partner_id uuid references auth.users (id) on delete set null;
+-- A number a partner removed (or replaced) stays for the CRM: removed_at / removed_by ('partner:<id>' or 'partner:<id>:changed').
+alter table public.society_prospect_contacts add column if not exists removed_at timestamptz;
+alter table public.society_prospect_contacts add column if not exists removed_by text not null default '';
 do $$ begin
   if exists (select 1 from pg_constraint where conname = 'society_prospect_contacts_source_check') then
     alter table public.society_prospect_contacts drop constraint society_prospect_contacts_source_check;
@@ -198,6 +201,40 @@ as $$
   select coalesce(nullif(trim(bp.name), ''), 'A MovEazy partner') from public.broker_partners bp where bp.user_id = p;
 $$;
 
+/** A partner's live numbers at a society, by kind: { manager, guard, broker }. */
+create or replace function public.sp_contact_counts(p_id uuid, p_partner uuid)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select jsonb_build_object(
+    'manager', count(*) filter (where c.kind = 'manager'),
+    'guard', count(*) filter (where c.kind = 'guard'),
+    'broker', count(*) filter (where c.kind = 'broker'))
+  from public.society_prospect_contacts c
+  where c.prospect_id = p_id and c.partner_id = p_partner and c.removed_at is null;
+$$;
+
+/** The society, if the caller is onboarding it or has onboarded it (any status) — for its numbers. */
+create or replace function public.sp_owned(p_id uuid)
+returns public.society_prospects
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  me uuid := public.sp_require();
+  s  public.society_prospects;
+begin
+  select * into s from public.society_prospects where id = p_id for update;
+  if s.id is null then raise exception 'No such society.' using errcode = '22023'; end if;
+  if s.onboard_by is distinct from me then raise exception 'Start onboarding this society first.' using errcode = '42501'; end if;
+  return s;
+end;
+$$;
+
 /** What's still missing before a society can be submitted. */
 create or replace function public.sp_missing(p_id uuid)
 returns text[]
@@ -212,14 +249,10 @@ declare
   a   text;
 begin
   select * into s from public.society_prospects where id = p_id;
-  if not exists (select 1 from public.society_prospect_contacts c where c.prospect_id = p_id and c.kind = 'manager' and c.partner_id = s.onboard_by) then
-    out := out || 'Property manager''s number'::text;
-  end if;
-  if not exists (select 1 from public.society_prospect_contacts c where c.prospect_id = p_id and c.kind = 'guard' and c.partner_id = s.onboard_by) then
-    out := out || 'A security guard''s number'::text;
-  end if;
-  if not exists (select 1 from public.society_prospect_contacts c where c.prospect_id = p_id and c.kind = 'broker' and c.partner_id = s.onboard_by) then
-    out := out || 'A broker''s contact'::text;
+  -- At least one number — the manager's, a guard's or a broker's (more are advised, not required).
+  if not exists (select 1 from public.society_prospect_contacts c where c.prospect_id = p_id and c.kind in ('manager', 'guard', 'broker')
+                    and c.partner_id = s.onboard_by and c.removed_at is null) then
+    out := out || 'At least one number: the society manager, a security guard or a broker'::text;
   end if;
   if cardinality(s.partner_amenities) = 0 then
     out := out || 'The amenities'::text;
@@ -255,7 +288,8 @@ as $$
     'facts', s.facts, 'added_by_partner', s.added_by_partner,
     'contacts', coalesce((select jsonb_agg(jsonb_build_object('id', c.id, 'kind', c.kind, 'name', c.name, 'phone', c.phone, 'note', c.note)
                                     order by array_position(array['manager', 'guard', 'broker'], c.kind), c.created_at)
-                            from public.society_prospect_contacts c where c.prospect_id = s.id and c.partner_id = auth.uid()), '[]'::jsonb),
+                            from public.society_prospect_contacts c where c.prospect_id = s.id and c.partner_id = auth.uid() and c.removed_at is null), '[]'::jsonb),
+    'contact_counts', public.sp_contact_counts(s.id, auth.uid()),
     'missing', public.sp_missing(s.id),
     'leads', (select count(*) from public.society_leads l where l.prospect_id = s.id and l.partner_id = auth.uid()),
     'amenity_list', to_jsonb(public.society_amenity_list()),
@@ -319,7 +353,8 @@ begin
                  -- For the map's preview card: the first amenities and the rents (the partner's, else research).
                  'amenities', to_jsonb(coalesce(s.amenities[1:6], '{}'::text[])),
                  'amenity_count', coalesce(cardinality(s.amenities), 0),
-                 'rents', case when coalesce(s.partner_rents, '{}'::jsonb) <> '{}'::jsonb then s.partner_rents else coalesce(s.rents, '{}'::jsonb) end) j
+                 'rents', case when coalesce(s.partner_rents, '{}'::jsonb) <> '{}'::jsonb then s.partner_rents else coalesce(s.rents, '{}'::jsonb) end,
+                 'contact_counts', case when s.onboard_by = me then public.sp_contact_counts(s.id, me) end) j
           from public.society_prospects s
          where not s.hidden and s.lat is not null
          order by 2 nulls last, s.name
@@ -346,7 +381,8 @@ begin
              'missing', cardinality(public.sp_missing(s.id)),
              'cover', coalesce(s.flat_photos -> 0 ->> 'url', ''),
              'leads', (select count(*) from public.society_leads l where l.prospect_id = s.id and l.partner_id = me),
-             'new_leads', (select count(*) from public.society_leads l where l.prospect_id = s.id and l.partner_id = me and l.stage = 'new'))
+             'new_leads', (select count(*) from public.society_leads l where l.prospect_id = s.id and l.partner_id = me and l.stage = 'new'),
+             'contact_counts', public.sp_contact_counts(s.id, me))
            order by array_position(array['sent_back', 'draft', 'submitted', 'approved'], s.onboard_status), s.onboard_started_at desc)
       from public.society_prospects s where s.onboard_by = me), '[]'::jsonb);
 end;
@@ -494,8 +530,9 @@ set search_path = public
 as $$
 declare
   cid uuid := nullif(p ->> 'id', '')::uuid;
-  s   public.society_prospects := public.sp_editable(nullif(p ->> 'society_id', '')::uuid);
+  s   public.society_prospects := public.sp_owned(nullif(p ->> 'society_id', '')::uuid);
   ph  text := public.normalize_mobile(coalesce(p ->> 'phone', ''));
+  old public.society_prospect_contacts;
 begin
   if coalesce(p ->> 'kind', '') not in ('manager', 'guard', 'broker') then raise exception 'Pick who this is.' using errcode = '22023'; end if;
   if coalesce(ph, '') = '' then raise exception 'Give a 10-digit mobile number.' using errcode = '22023'; end if;
@@ -505,10 +542,21 @@ begin
     values (s.id, p ->> 'kind', left(trim(coalesce(p ->> 'name', '')), 80), ph, left(coalesce(p ->> 'note', ''), 300),
             'partner', auth.uid(), 'partner:' || auth.uid());
   else
-    update public.society_prospect_contacts c set kind = p ->> 'kind', name = left(trim(coalesce(p ->> 'name', '')), 80), phone = ph,
-           note = left(coalesce(p ->> 'note', ''), 300), updated_at = now()
-     where c.id = cid and c.prospect_id = s.id and c.partner_id = auth.uid();
-    if not found then raise exception 'No such number.' using errcode = '22023'; end if;
+    select * into old from public.society_prospect_contacts c
+     where c.id = cid and c.prospect_id = s.id and c.partner_id = auth.uid() and c.removed_at is null;
+    if old.id is null then raise exception 'No such number.' using errcode = '22023'; end if;
+    if old.phone is distinct from ph then
+      -- A new number: the old one is kept for the CRM, marked replaced.
+      update public.society_prospect_contacts set removed_at = now(), removed_by = 'partner:' || auth.uid() || ':changed', updated_at = now()
+       where id = old.id;
+      insert into public.society_prospect_contacts (prospect_id, kind, name, phone, note, source, partner_id, created_by)
+      values (s.id, p ->> 'kind', left(trim(coalesce(p ->> 'name', '')), 80), ph, left(coalesce(p ->> 'note', ''), 300),
+              'partner', auth.uid(), 'partner:' || auth.uid());
+    else
+      update public.society_prospect_contacts c set kind = p ->> 'kind', name = left(trim(coalesce(p ->> 'name', '')), 80),
+             note = left(coalesce(p ->> 'note', ''), 300), updated_at = now()
+       where c.id = old.id;
+    end if;
   end if;
   update public.society_prospects set updated_at = now() where id = s.id;
   return public.sp_json(s.id);
@@ -525,10 +573,11 @@ declare
   sid uuid;
   s   public.society_prospects;
 begin
-  select prospect_id into sid from public.society_prospect_contacts where id = p_id and partner_id = auth.uid();
+  select prospect_id into sid from public.society_prospect_contacts where id = p_id and partner_id = auth.uid() and removed_at is null;
   if sid is null then raise exception 'No such number.' using errcode = '22023'; end if;
-  s := public.sp_editable(sid);
-  delete from public.society_prospect_contacts where id = p_id;
+  s := public.sp_owned(sid);
+  -- Kept for the CRM ("removed by partner"); gone from the partner's app.
+  update public.society_prospect_contacts set removed_at = now(), removed_by = 'partner:' || auth.uid(), updated_at = now() where id = p_id;
   return public.sp_json(s.id);
 end;
 $$;
@@ -987,6 +1036,7 @@ begin
   foreach f in array array[
     'public.sp_metres(numeric, numeric, numeric, numeric)', 'public.sp_require()', 'public.sp_partner_name(uuid)',
     'public.sp_missing(uuid)', 'public.sp_json(uuid)', 'public.sp_editable(uuid)',
+    'public.sp_contact_counts(uuid, uuid)', 'public.sp_owned(uuid)',
     'public.society_live_card(public.society_prospects)'] loop
     execute format('revoke all on function %s from public, anon, authenticated', f);
   end loop;
