@@ -87,6 +87,24 @@ check(r.error && /permission to edit properties/.test(r.error.message), "Deal of
 r = await as(db, editor, "select public.crm_deal_day_set(public.deal_this_monday(), '2bhk', 'MZ-A1')");
 check(!r.error, "someone who edits properties sets the Deal of the Day", r.error?.message);
 
+console.log("\nadd every flat of a type");
+for (let n = 1; n <= 24; n++) {
+  await db.exec(`insert into public.inventory (property_id, posted_by, poster_id, area, rent, status, flat_type) values ('MZ-B${n}', 'owner', null, 'HSR Layout', ${50000 - n * 100}, 'published', '2BHK')`);
+}
+r = await as(db, agent, "select public.crm_deal_steal_add_kind(null, '2bhk')");
+const after = one(r)?.steal?.map((x) => x.property_id) ?? [];
+check(!r.error && after.length === 2 + 24 + 0, "adds every live 2 BHK — past the old 20-a-week cap", r.error?.message || after.length);
+check(after[0] === "MZ-A3" && after[1] === "MZ-A1" && after[2] === "MZ-B24", "after the ones already in, cheapest first", after.slice(0, 3).join());
+check(!after.includes("MZ-OLD") && !after.includes("MZ-A2"), "no paused flat, no other type");
+r = await as(db, agent, "select public.crm_deal_steal_add_kind(null, '2bhk')");
+check(!r.error && one(r).steal.length === after.length, "adding the type again changes nothing", r.error?.message);
+r = await as(db, agent, "select public.crm_deal_steal_add_kind(null, '5bhk')");
+check(r.error && /Pick a flat type/.test(r.error.message), "an unknown type is refused", r.error?.message);
+r = await as(db, tenant, "select public.crm_deal_steal_add_kind(null, '1bhk')");
+check(Boolean(r.error), "a tenant may not");
+r = await as(db, agent, "select public.crm_deal_steal_set(public.deal_this_monday(), array['MZ-A3', 'MZ-A1'])");
+check(!r.error && one(r).steal.length === 2, "and the week can be set back to two", r.error?.message);
+
 console.log("\nnobody else");
 r = await as(db, tenant, "select public.crm_deal_steal_add(null, 'MZ-A2')");
 check(r.error && /CRM staff only/.test(r.error.message), "a signed-in tenant is refused", r.error?.message);

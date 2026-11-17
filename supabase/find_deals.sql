@@ -4,7 +4,7 @@
 -- Run in the Supabase SQL editor AFTER inventory_schema.sql and crm_schema.sql
 -- (has_admin_scope). Safe to re-run.
 --
---   steal_deals   Steal Deals of the Week: up to 20 flats the team picks for a
+--   steal_deals   Steal Deals of the Week: the flats the team picks (no cap) for a
 --                 Monday–Sunday week (IST). The site shows this week's list; a
 --                 week with nothing picked keeps the last week that had one.
 --   day_deals     Deal of the Day: one flat per type (1 RK, 1 BHK, 2 BHK,
@@ -157,10 +157,12 @@ begin
     'week_start', mon,
     'week_end', mon + 6,
     'today', today,
+    -- Each flat drawn once (the list has no cap: an "add all 2 BHK" week can hold a hundred).
     'steal', coalesce((
-      select jsonb_agg(public.deal_flat_json(s.property_id) order by s.sort, s.created_at)
-        from public.steal_deals s
-       where s.week_start = wk and public.deal_flat_json(s.property_id) is not null), '[]'::jsonb),
+      select jsonb_agg(x.j order by x.sort, x.created_at)
+        from (select s.sort, s.created_at, public.deal_flat_json(s.property_id) j
+                from public.steal_deals s where s.week_start = wk) x
+       where x.j is not null), '[]'::jsonb),
     'day', coalesce((
       select jsonb_agg(d.j || jsonb_build_object('kind', d.kind, 'since', d.day) order by array_position(array['1rk', '1bhk', '2bhk', '3bhk'], d.kind))
         from (
@@ -251,7 +253,7 @@ begin
 end;
 $$;
 
-/** Set a week's Steal Deals to exactly these flats, in this order (up to 20, published only). */
+/** Set a week's Steal Deals to exactly these flats, in this order (live flats only; no cap since 2026-11-17). */
 create or replace function public.crm_deal_steal_set(p_week date, p_ids text[])
 returns jsonb
 language plpgsql
@@ -266,7 +268,6 @@ declare
   bad text;
 begin
   if p_week is null then raise exception 'Pick a week.' using errcode = '22023'; end if;
-  if cardinality(ids) > 20 then raise exception 'Up to 20 Steal Deals a week.' using errcode = '22023'; end if;
   select x into bad from unnest(ids) x
    where not exists (select 1 from public.inventory i where i.property_id = x and i.status = 'published') limit 1;
   if bad is not null then raise exception '% isn''t a live flat.', bad using errcode = '22023'; end if;
@@ -294,6 +295,33 @@ begin
   select array_agg(property_id order by sort, created_at) into cur from public.steal_deals where week_start = wk;
   if p_property = any(coalesce(cur, '{}')) then return public.crm_deals(wk, null, null); end if;
   return public.crm_deal_steal_set(wk, coalesce(cur, '{}') || p_property);
+end;
+$$;
+
+/**
+ * Add every live flat of one type (1rk, 1bhk, 2bhk, 3bhk — deal_kind) to a
+ * week's Steal Deals, cheapest first after the ones already in. Any CRM user.
+ */
+create or replace function public.crm_deal_steal_add_kind(p_week date, p_kind text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  wk  date := date_trunc('week', coalesce(p_week, public.deal_this_monday()))::date;
+  cur text[];
+  more text[];
+begin
+  perform public.crm_deal_staff();
+  if p_kind is null or p_kind not in ('1rk', '1bhk', '2bhk', '3bhk') then
+    raise exception 'Pick a flat type.' using errcode = '22023';
+  end if;
+  select coalesce(array_agg(property_id order by sort, created_at), '{}') into cur from public.steal_deals where week_start = wk;
+  select coalesce(array_agg(i.property_id order by i.rent nulls last, i.property_id), '{}') into more
+    from public.inventory i
+   where i.status = 'published' and public.deal_kind(i.flat_type) = p_kind and not (i.property_id = any(cur));
+  return public.crm_deal_steal_set(wk, cur || more);
 end;
 $$;
 
@@ -344,7 +372,7 @@ declare
 begin
   foreach f in array array[
     'public.crm_deals(date, date, date)', 'public.crm_deal_steal_set(date, text[])',
-    'public.crm_deal_steal_add(date, text)', 'public.crm_deal_day_set(date, text, text)'] loop
+    'public.crm_deal_steal_add(date, text)', 'public.crm_deal_steal_add_kind(date, text)', 'public.crm_deal_day_set(date, text, text)'] loop
     execute format('revoke all on function %s from public, anon', f);
     execute format('grant execute on function %s to authenticated', f);
   end loop;
