@@ -145,6 +145,9 @@ row = await bp(E);
 check(!r.error && row.referred_by === "ASHA01" && row.referred_via === "link", "?ref= on the device: mapped via 'link'", JSON.stringify(row));
 await as(esha, "select public.partner_signup_meta('', 'OTHER9', '{}')");
 check((await bp(E)).referred_by === "ASHA01", "a later stamp never overwrites");
+r = await as(chetan, "select public.partner_signup_meta('referral', 'ASHA01', '{}')");
+row = await bp(C);
+check(!r.error && !row.referred_by && !row.referred_via, "a partner of 40 days who opens a link later isn't credited to it (link: 24 hours)", r.error?.message ?? JSON.stringify(row));
 
 console.log("\nWho invited you?");
 let t = one(await as(bala, "select public.partner_my_team()"));

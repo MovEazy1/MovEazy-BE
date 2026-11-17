@@ -170,6 +170,13 @@ begin
     update public.partner_prospects set user_id = uid, updated_at = now() where phone = pr.phone;
   end if;
 
+  -- A link's code (kept by the browser for 24 hours — lib/partnerSignup.js) credits a
+  -- partner who signed up within those 24 hours, never one who was already a
+  -- partner and opened someone's link later, and never their own code.
+  if bp.created_at < now() - interval '1 day' or ref = coalesce(upper(bp.referral_code), '') then
+    ref := '';
+  end if;
+
   update public.broker_partners
      set signup_channel = case when signup_channel = ''
                                then coalesce(nullif(pr.channel, ''), nullif(public.partner_clean_tag(p_channel, 40), ''), 'direct')
