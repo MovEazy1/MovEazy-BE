@@ -17,7 +17,7 @@
 -- A deal flat rented mid-week stays on the list, marked rented.
 --
 -- The tables are read through deals_feed() only; the team changes them through
--- the crm_deal_* functions (crm.properties.write).
+-- the crm_deal_* functions — Steal Deals: any CRM user; Deal of the Day: crm.properties.write.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 begin;
@@ -190,6 +190,27 @@ begin
 end;
 $$;
 
+/**
+ * Steal Deals of the Week: anyone with CRM access may see the deals and add or
+ * remove the week's flats (asked for 2026-11-17 — every CRM user can put a
+ * property in from the Properties section). Deal of the Day stays with
+ * crm.properties.write (crm_deal_guard).
+ */
+create or replace function public.crm_deal_staff()
+returns text
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_crm_staff() then
+    raise exception 'CRM staff only.' using errcode = '42501';
+  end if;
+  return lower(coalesce(auth.jwt() ->> 'email', ''));
+end;
+$$;
+
 /** A flat as the CRM's deal lists show it. */
 create or replace function public.crm_deal_flat(p text)
 returns jsonb
@@ -215,7 +236,7 @@ as $$
 declare
   wk date := date_trunc('week', coalesce(p_week, public.deal_this_monday()))::date;
 begin
-  perform public.crm_deal_guard();
+  perform public.crm_deal_staff();
   return jsonb_build_object(
     'week_start', wk,
     'this_monday', public.deal_this_monday(),
@@ -238,7 +259,7 @@ security definer
 set search_path = public
 as $$
 declare
-  who text := public.crm_deal_guard();
+  who text := public.crm_deal_staff();
   wk  date := date_trunc('week', p_week)::date;
   -- Once each, in the order given.
   ids text[] := array(select x from unnest(coalesce(p_ids, '{}')) with ordinality u(x, n) where coalesce(x, '') <> '' group by x order by min(n));
@@ -269,7 +290,7 @@ declare
   wk  date := date_trunc('week', coalesce(p_week, public.deal_this_monday()))::date;
   cur text[];
 begin
-  perform public.crm_deal_guard();
+  perform public.crm_deal_staff();
   select array_agg(property_id order by sort, created_at) into cur from public.steal_deals where week_start = wk;
   if p_property = any(coalesce(cur, '{}')) then return public.crm_deals(wk, null, null); end if;
   return public.crm_deal_steal_set(wk, coalesce(cur, '{}') || p_property);
@@ -315,6 +336,7 @@ revoke all on function public.deal_flat_json(text) from public, anon, authentica
 revoke all on function public.deals_feed() from public;
 grant execute on function public.deals_feed() to anon, authenticated;
 revoke all on function public.crm_deal_guard() from public, anon, authenticated;
+revoke all on function public.crm_deal_staff() from public, anon, authenticated;
 revoke all on function public.crm_deal_flat(text) from public, anon, authenticated;
 do $$
 declare
