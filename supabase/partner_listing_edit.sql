@@ -12,6 +12,9 @@
 -- flats they posted themselves, so a CRM-uploaded flat in their inventory
 -- could not be corrected at all.
 --
+-- A partner can also delete their flat (status 'deleted', 2026-11-17): it stays in
+-- the table for MovEazy, hidden from them, tenants and other brokers.
+--
 -- Safe to re-run.
 
 begin;
@@ -30,7 +33,9 @@ begin
   if uid is null or not public.owns_listing(p_property, uid) then
     raise exception 'Not your flat.' using errcode = '42501';
   end if;
-  if st is not null and st not in ('published', 'paused', 'rented') then
+  -- 'deleted': the partner deleted it from their inventory (FlatActions.jsx). It is
+  -- kept — off MovEazy for everyone, out of their app — and the CRM can restore it.
+  if st is not null and st not in ('published', 'paused', 'rented', 'deleted') then
     raise exception 'Unknown status.' using errcode = '22023';
   end if;
   if has ? 'rent' and coalesce((has ->> 'rent')::numeric, 0) < 0 then

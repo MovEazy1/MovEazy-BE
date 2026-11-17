@@ -166,7 +166,11 @@ begin
 end;
 $$;
 
-/** Back on the market: published again; the history keeps the sale. */
+/**
+ * Back on the market: published again; the history keeps the sale. Also
+ * restores a flat a partner deleted from their inventory (status 'deleted',
+ * partner_listing_edit.sql).
+ */
 create or replace function public.crm_relist(p_property text)
 returns jsonb
 language plpgsql
@@ -180,9 +184,9 @@ begin
     raise exception 'You need "Add and edit listings" to do this.' using errcode = '42501';
   end if;
   update public.inventory set status = 'published', updated_at = now()
-   where property_id = p_property and status = 'rented'
+   where property_id = p_property and status in ('rented', 'deleted')
   returning * into r;
-  if r.property_id is null then raise exception 'That listing is not sold out.' using errcode = '22023'; end if;
+  if r.property_id is null then raise exception 'That listing is not sold out or deleted.' using errcode = '22023'; end if;
   return jsonb_build_object('property_id', r.property_id, 'status', r.status);
 end;
 $$;
