@@ -906,6 +906,41 @@ $$;
 
 /* ── Tenants ──────────────────────────────────────────────────────────────── */
 
+/** On the tenant site: onboarded by a partner (live), or researched (amenities or rents) until one does. */
+create or replace function public.sp_listed(s public.society_prospects)
+returns boolean
+language sql
+immutable
+as $$
+  select not s.hidden and (s.live or cardinality(s.amenities) > 0 or coalesce(s.rents, '{}'::jsonb) <> '{}'::jsonb);
+$$;
+
+/** A society's page code (6 letters/digits), given the moment it can be listed. */
+create or replace function public.sp_code_trg()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  code text;
+  i    int;
+begin
+  if new.public_code is null and (new.live or cardinality(new.amenities) > 0 or coalesce(new.rents, '{}'::jsonb) <> '{}'::jsonb) then
+    for i in 1..25 loop
+      select string_agg(substr('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', 1 + floor(random() * 32)::int, 1), '') into code from generate_series(1, 6);
+      exit when not exists (select 1 from public.society_prospects where public_code = code);
+    end loop;
+    new.public_code := code;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists society_prospects_code on public.society_prospects;
+create trigger society_prospects_code before insert or update on public.society_prospects
+  for each row execute function public.sp_code_trg();
+
 /** A live society for a card: never the gate — the spot is rounded to ~100 m. */
 create or replace function public.society_live_card(s public.society_prospects)
 returns jsonb
@@ -916,6 +951,7 @@ as $$
     'code', s.public_code, 'name', s.name, 'area', s.area, 'road', s.road,
     'lat', round(s.lat, 3), 'lng', round(s.lng, 3), 'cover', coalesce(s.photos[1], ''), 'photos', cardinality(s.photos),
     'amenities', to_jsonb(s.amenities[1:6]), 'amenity_count', cardinality(s.amenities),
+    'amenity_tags', to_jsonb(s.amenities), 'verified', s.live,
     'rents', case when s.partner_rents <> '{}'::jsonb then s.partner_rents else s.rents end,
     'facts', jsonb_build_object('builder', s.facts ->> 'builder', 'towers', s.facts ->> 'towers', 'total_flats', s.facts ->> 'total_flats'));
 $$;
@@ -932,7 +968,7 @@ as $$
            case when p_lat is null or s.lat is null then null else round(public.sp_metres(p_lat, p_lng, s.lat, s.lng)) end)
          order by case when p_lat is null or s.lat is null then null else public.sp_metres(p_lat, p_lng, s.lat, s.lng) end nulls last, s.name), '[]'::jsonb)
     from public.society_prospects s
-   where s.live and s.public_code is not null and not s.hidden;
+   where public.sp_listed(s) and s.public_code is not null;
 $$;
 
 /** One live society's page: photos by amenity and the sample flat, facts, rents, nearby. No numbers. */
@@ -950,9 +986,9 @@ as $$
                                          from jsonb_each(s.amenity_photos) a), '{}'::jsonb),
            'flat_photos', coalesce((select jsonb_agg(jsonb_build_object('slot', p ->> 'slot', 'url', p ->> 'url')) from jsonb_array_elements(s.flat_photos) p), '[]'::jsonb),
            'facts_all', s.facts - 'about', 'about', s.facts ->> 'about', 'nearby', s.nearby,
-           'partner_first_name', (select split_part(trim(bp.name), ' ', 1) from public.broker_partners bp where bp.user_id = s.onboard_by))
+           'partner_first_name', case when s.live then (select split_part(trim(bp.name), ' ', 1) from public.broker_partners bp where bp.user_id = s.onboard_by) end)
     from public.society_prospects s
-   where s.public_code = upper(trim(p_code)) and s.live and not s.hidden;
+   where s.public_code = upper(trim(p_code)) and public.sp_listed(s);
 $$;
 
 /**
@@ -978,8 +1014,8 @@ declare
   e   text;
   isnew boolean := false;
 begin
-  select * into s from public.society_prospects where public_code = upper(trim(p_code)) and live and not hidden;
-  if s.id is null then raise exception 'This society isn''t listed right now.' using errcode = '22023'; end if;
+  select * into s from public.society_prospects where public_code = upper(trim(p_code));
+  if s.id is null or not public.sp_listed(s) then raise exception 'This society isn''t listed right now.' using errcode = '22023'; end if;
 
   if auth.uid() is not null then
     select c.id, c.name, c.phone into cid, nm, ph from public.crm_clients c where c.user_id = auth.uid();
@@ -990,7 +1026,8 @@ begin
   end if;
   if cid is null or coalesce(ph, '') = '' then raise exception 'Verify your mobile number first.' using errcode = '42501'; end if;
 
-  select bp.user_id, bp.name, bp.phone, bp.status into partner from public.broker_partners bp where bp.user_id = s.onboard_by;
+  -- Only a partner whose onboarding is approved (the society is live) gets its tenants.
+  select bp.user_id, bp.name, bp.phone, bp.status into partner from public.broker_partners bp where bp.user_id = s.onboard_by and s.live;
 
   -- One lead per tenant per society a day: asking twice doesn't double it.
   select id into lid from public.society_leads
@@ -998,16 +1035,19 @@ begin
   if lid is null then
     isnew := true;
     insert into public.society_leads (prospect_id, partner_id, client_id, name, phone)
-    values (s.id, s.onboard_by, cid, coalesce(nm, ''), ph) returning id into lid;
+    values (s.id, partner.user_id, cid, coalesce(nm, ''), ph) returning id into lid;
     insert into public.society_lead_events (lead_id, actor, kind, body)
-    values (lid, coalesce(nullif(nm, ''), 'Tenant'), 'enquired', format('Asked for flats in %s on moveazy.co.in — sent to %s', s.name, coalesce(nullif(partner.name, ''), 'the partner')));
+    values (lid, coalesce(nullif(nm, ''), 'Tenant'), 'enquired',
+            case when partner.user_id is null then format('Asked for flats in %s on moveazy.co.in — no partner yet, the MovEazy team follows up', s.name)
+                 else format('Asked for flats in %s on moveazy.co.in — sent to %s', s.name, coalesce(nullif(partner.name, ''), 'the partner')) end);
   end if;
 
   perform public.crm_lead_activate(cid, 'society enquiry');
   if isnew then
     update public.crm_clients set interests = interests || ('society:' || s.public_code) where id = cid and not (('society:' || s.public_code) = any(interests));
     insert into public.crm_activities (client_id, type, body)
-    values (cid, 'partner', format('Asked for flats in %s — sent to partner %s (%s)', s.name, coalesce(nullif(partner.name, ''), '—'), coalesce(partner.phone, '')));
+    values (cid, 'partner', case when partner.user_id is null then format('Asked for flats in %s — no partner yet, follow up', s.name)
+                                 else format('Asked for flats in %s — sent to partner %s (%s)', s.name, coalesce(nullif(partner.name, ''), '—'), coalesce(partner.phone, '')) end);
     if partner.user_id is not null then
       insert into public.partner_notifications (broker_id, kind, title, body, link)
       values (partner.user_id, 'society_lead', format('New tenant for %s', s.name),
@@ -1017,7 +1057,8 @@ begin
     for e in select x from public.crm_team_emails() x loop
       insert into public.crm_notifications (for_email, type, title, body, client_id)
       values (e, 'society_lead', format('Society lead: %s', s.name),
-              format('%s is contacting %s for %s.', coalesce(nullif(nm, ''), 'A tenant'), coalesce(nullif(partner.name, ''), 'the partner'), s.name), cid);
+              case when partner.user_id is null then format('%s wants a flat in %s — no partner yet. Follow up.', coalesce(nullif(nm, ''), 'A tenant'), s.name)
+                   else format('%s is contacting %s for %s.', coalesce(nullif(nm, ''), 'A tenant'), coalesce(nullif(partner.name, ''), 'the partner'), s.name) end, cid);
     end loop;
   end if;
 
@@ -1037,7 +1078,7 @@ begin
     'public.sp_metres(numeric, numeric, numeric, numeric)', 'public.sp_require()', 'public.sp_partner_name(uuid)',
     'public.sp_missing(uuid)', 'public.sp_json(uuid)', 'public.sp_editable(uuid)',
     'public.sp_contact_counts(uuid, uuid)', 'public.sp_owned(uuid)',
-    'public.society_live_card(public.society_prospects)'] loop
+    'public.society_live_card(public.society_prospects)', 'public.sp_listed(public.society_prospects)', 'public.sp_code_trg()'] loop
     execute format('revoke all on function %s from public, anon, authenticated', f);
   end loop;
   foreach f in array array[
