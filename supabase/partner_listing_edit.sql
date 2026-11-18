@@ -15,6 +15,9 @@
 -- A partner can also delete their flat (status 'deleted', 2026-11-17): it stays in
 -- the table for MovEazy, hidden from them, tenants and other brokers.
 --
+-- Washrooms (bathrooms, 2026-11-18): asked right after the type when a partner
+-- uploads or edits a flat, so the edit form reads and saves it too.
+--
 -- Safe to re-run.
 
 begin;
@@ -46,6 +49,7 @@ begin
     flat_type         = case when has ? 'flat_type' then left(coalesce(has ->> 'flat_type', ''), 60) else i.flat_type end,
     property_type     = case when has ? 'property_type' then left(coalesce(has ->> 'property_type', ''), 60) else i.property_type end,
     bedrooms          = case when has ? 'bedrooms' then nullif(has ->> 'bedrooms', '')::int else i.bedrooms end,
+    bathrooms         = case when has ? 'bathrooms' then greatest(1, least(20, coalesce(nullif(has ->> 'bathrooms', '')::int, 1))) else i.bathrooms end,
     rent              = case when has ? 'rent' then coalesce(nullif(has ->> 'rent', '')::numeric, 0) else i.rent end,
     deposit           = case when has ? 'deposit' then coalesce(nullif(has ->> 'deposit', '')::numeric, 0) else i.deposit end,
     maintenance       = case when has ? 'maintenance' then nullif(has ->> 'maintenance', '')::numeric else i.maintenance end,
@@ -82,7 +86,7 @@ begin
   end if;
   return (select jsonb_build_object(
             'property_id', i.property_id, 'status', i.status, 'flat_type', i.flat_type, 'property_type', i.property_type,
-            'bedrooms', i.bedrooms, 'rent', i.rent, 'deposit', i.deposit, 'maintenance', i.maintenance, 'furnishing', i.furnishing,
+            'bedrooms', i.bedrooms, 'bathrooms', i.bathrooms, 'rent', i.rent, 'deposit', i.deposit, 'maintenance', i.maintenance, 'furnishing', i.furnishing,
             'area', i.area, 'nearby_areas', i.nearby_areas, 'latitude', i.latitude, 'longitude', i.longitude,
             'occupants_allowed', i.occupants_allowed, 'amenities', i.amenities, 'available_from', i.available_from,
             'floor_number', i.floor_number, 'title', i.title, 'description', i.description,
