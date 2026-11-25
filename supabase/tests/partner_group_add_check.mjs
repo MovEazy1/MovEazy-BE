@@ -80,7 +80,7 @@ await db.exec(file("partner_group_add.sql"));
 await db.exec(file("partner_group_add.sql"));
 check(true, "partner_group_add.sql applies, and re-applies over itself");
 const kinds = (await q(db, "select pg_get_constraintdef(oid) d from pg_constraint where conname = 'partner_notifications_kind_check'"))[0].d;
-check(/tenant_liked/.test(kinds) && /visit_assigned/.test(kinds) && !/text,|,text|kind,/.test(kinds.split("ANY")[1] || "") && /group_added/.test(kinds) && /group_joined/.test(kinds), "notification kinds kept, two added", kinds);
+check(/tenant_liked/.test(kinds) && /visit_assigned/.test(kinds) && !/btextb,|,textb|bkindb,/.test(kinds.split("ANY")[1] || "") && /group_added/.test(kinds) && /group_joined/.test(kinds), "notification kinds kept, two added", kinds);
 
 console.log("\na member adds an approved partner by number");
 let r = await as(db, MEMBER, `select public.partner_add_member_by_phone('${G}', '+91 80000 00004')`);
